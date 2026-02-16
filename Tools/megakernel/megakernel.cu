@@ -5,7 +5,8 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include "rmsnorm.cuh"
-
+#include "swiglu.cuh"
+#include "swiglu.cu"
 namespace cg = cooperative_groups;
 
 // Model constants 
@@ -71,7 +72,7 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 #endif
 
 constexpr int LDG_NUM_WARPS = LDG_LM_BLOCK_SIZE/WARP_SIZE;
-
+constexpr float LDG_RMS_EPS = 1e-6f;
 // LM_head
 constexpr int LDG_VOCAB_SIZE = 151936;
 
@@ -471,3 +472,338 @@ __device__ void ldg_attention(
 }
 
 // O projection + Residual + PostNorm + MLP(_ldg)
+__device__ void ldg_o_proj_postnorm_mlp(
+    AtomicGridSync &grid, 
+    const __half *__restrict__ o_weight,
+    const __half *__restrict__ post_norm_weight,
+    const __half *__restrict__ gate_weight,
+    const __half *__restrict__ up_weight,
+    const __half *__restrict__ down_weight,
+    const float *__restrict__ attn_out, 
+    float *__restrict__ g_residual,
+    float *__restrict__ g_activations, 
+    float *__restrict__ g_mlp_intermediate,
+    __half *__restrict__ hidden_out
+) {
+    int block_id = blockIdx.x;
+    int num_blocks = gridDim.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    __shared__ __align__(16) __half s_attn[Q_SIZE];
+    __shared__ __align__(16) __half s_act[HIDDEN_SIZE];
+    __shared__ __align__(16) __half s_mlp[INTERMEDIATE_SIZE];
+
+    // Cache attention output (Input is float, store as half in smem)
+    for (int i = threadIdx.x; i < Q_SIZE; i += LDG_BLOCK_SIZE) {
+        s_attn[i] = __float2half(attn_out[i]);
+    }
+    __syncthreads();
+
+    // 2. O Projection + Residual
+    int hid_per_block = (HIDDEN_SIZE + num_blocks - 1) / num_blocks;
+    int hid_start = block_id * hid_per_block;
+    int hid_end = min(hid_start + hid_per_block, HIDDEN_SIZE);
+
+    for (int m = hid_start + warp_id; m < hid_end; m += LDG_NUM_WARPS) {
+        float sum = 0.0f;
+        const uint4* o_row_ptr = reinterpret_cast<const uint4*>(o_weight + m * Q_SIZE);
+
+        #pragma unroll 4
+        for (int k = lane_id; k < Q_SIZE / 8; k += WARP_SIZE) {
+            // 128-bit optimized load from megakernel.cu
+            uint4 w_u4 = ldg_load_weights_u4(o_row_ptr + k);
+            uint4 a_u4 = *reinterpret_cast<const uint4*>(s_attn + k * 8);
+            
+            half2* wh = reinterpret_cast<half2*>(&w_u4);
+            half2* ah = reinterpret_cast<half2*>(&a_u4);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float2 fw = __half22float2(wh[i]);
+                float2 fa = __half22float2(ah[i]);
+                sum += (fw.x * fa.x) + (fw.y * fa.y);
+            }
+        }
+        sum = ldg_warp_reduce_sum(sum);
+        if (lane_id == 0) {
+            g_activations[m] = sum + g_residual[m];
+        }
+    }
+
+    grid.sync(); 
+    
+    // Post-Attention RMSNorm (Redundant across blocks to avoid extra syncs)
+    {
+        __shared__ float s_sum_sq;
+        if (threadIdx.x == 0) s_sum_sq = 0.0f;
+        __syncthreads();
+
+        float local_ss = 0.0f;
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+            float v = g_activations[i];
+            s_act[i] = __float2half(v); 
+            local_ss += v * v;
+            if (block_id == 0) g_residual[i] = v; // Save residual for next layer
+        }
+        local_ss = ldg_warp_reduce_sum(local_ss);
+        if (lane_id == 0) atomicAdd(&s_sum_sq, local_ss);
+        __syncthreads();
+
+        float rstd = rsqrtf(s_sum_sq / (float)HIDDEN_SIZE + LDG_RMS_EPS);
+
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+            float w = __half2float(post_norm_weight[i]);
+            s_act[i] = __float2half(__half2float(s_act[i]) * rstd * w);
+        }
+        __syncthreads();
+    }
+
+    // 4. Gate + Up + SiLU (SwiGLU)
+    int int_per_block = (INTERMEDIATE_SIZE + num_blocks - 1) / num_blocks;
+    int int_start = block_id * int_per_block;
+    int int_end = min(int_start + int_per_block, INTERMEDIATE_SIZE);
+
+    for (int m = int_start + warp_id; m < int_end; m += LDG_NUM_WARPS) {
+        float gate_sum = 0.0f, up_sum = 0.0f;
+        const uint4* g_row = reinterpret_cast<const uint4*>(gate_weight + m * HIDDEN_SIZE);
+        const uint4* u_row = reinterpret_cast<const uint4*>(up_weight + m * HIDDEN_SIZE);
+
+        #pragma unroll 4
+        for (int k = lane_id; k < HIDDEN_SIZE / 8; k += WARP_SIZE) {
+            uint4 g_u4 = ldg_load_weights_u4(g_row + k);
+            uint4 u_u4 = ldg_load_weights_u4(u_row + k);
+            uint4 a_u4 = *reinterpret_cast<const uint4*>(s_act + k * 8);
+
+            half2* gh = reinterpret_cast<half2*>(&g_u4);
+            half2* uh = reinterpret_cast<half2*>(&u_u4);
+            half2* ah = reinterpret_cast<half2*>(&a_u4);
+
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float2 fa = __half22float2(ah[i]);
+                gate_sum += (__half2float(gh[i].x) * fa.x) + (__half2float(gh[i].y) * fa.y);
+                up_sum   += (__half2float(uh[i].x) * fa.x) + (__half2float(uh[i].y) * fa.y);
+            }
+        }
+        gate_sum = ldg_warp_reduce_sum(gate_sum);
+        up_sum = ldg_warp_reduce_sum(up_sum);
+
+        if (lane_id == 0) {
+            // Optimized silu from megakernel.cu
+            float activated = __half2float(ldg_silu(__float2half(gate_sum))) * up_sum;
+            g_mlp_intermediate[m] = activated;
+        }
+    }
+
+    grid.sync();
+
+    // 5. Down projection + residual
+    for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += LDG_BLOCK_SIZE) {
+        s_mlp[i] = __float2half(g_mlp_intermediate[i]);
+    }
+    __syncthreads();
+
+    for (int m = hid_start + warp_id; m < hid_end; m += LDG_NUM_WARPS) {
+        float sum = 0.0f;
+        const uint4* d_row = reinterpret_cast<const uint4*>(down_weight + m * INTERMEDIATE_SIZE);
+
+        #pragma unroll 4
+        for (int k = lane_id; k < INTERMEDIATE_SIZE / 8; k += WARP_SIZE) {
+            uint4 d_u4 = ldg_load_weights_u4(d_row + k);
+            uint4 m_u4 = *reinterpret_cast<const uint4*>(s_mlp + k * 8);
+
+            half2* dh = reinterpret_cast<half2*>(&d_u4);
+            half2* mh = reinterpret_cast<half2*>(&m_u4);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float2 fd = __half22float2(dh[i]);
+                float2 fm = __half22float2(mh[i]);
+                sum += (fd.x * fm.x) + (fd.y * fm.y);
+            }
+        }
+        sum = ldg_warp_reduce_sum(sum);
+        if (lane_id == 0) {
+            hidden_out[m] = __float2half(sum + g_residual[m]);
+        }
+    }
+    grid.sync();
+}
+/**
+ * Fused LM Head Kernel (ArgMax) Optimized for GTX 1650 (sm_75)
+ * Requirements: HIDDEN_SIZE must be a multiple of 8 for uint4 alignment.
+ */
+__global__ void ldg_lm_head_fused(
+    const float *__restrict__ hidden,
+    const half *__restrict__ weight,    
+    float *__restrict__ block_max_vals,
+    int *__restrict__ block_max_idxs,
+    int *__restrict__ output_token,
+    unsigned int *__restrict__ counter,
+    int num_blocks) 
+{
+    // BLOCK-LOCAL MAX CALCULATION
+    __shared__ __align__(128) float s_hidden[HIDDEN_SIZE];
+
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_LM_BLOCK_SIZE) {
+        s_hidden[i] = hidden[i];
+    }
+    __syncthreads();
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    // Vocabulary partitioning across blocks
+    int rows_per_block = (LDG_VOCAB_SIZE + gridDim.x - 1) / gridDim.x;
+    int row_start = blockIdx.x * rows_per_block;
+    int row_end = min(row_start + rows_per_block, LDG_VOCAB_SIZE);
+
+    float local_max = -INFINITY;
+    int local_max_idx = -1;
+
+    int warp_stride = LDG_LM_BLOCK_SIZE / WARP_SIZE;
+    int base = row_start + warp_id * LDG_LM_ROWS_PER_WARP;
+
+    for (int m_base = base; m_base < row_end; m_base += warp_stride * LDG_LM_ROWS_PER_WARP) {
+        int rows[LDG_LM_ROWS_PER_WARP];
+        bool valid[LDG_LM_ROWS_PER_WARP];
+        
+        #pragma unroll
+        for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+            rows[r] = m_base + r;
+            valid[r] = rows[r] < row_end;
+        }
+
+        float sum[LDG_LM_ROWS_PER_WARP];
+        #pragma unroll
+        for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) sum[r] = 0.0f;
+
+        // Optimized dot product using 128-bit loads
+        #pragma unroll 4
+        for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
+            // Load 8 float activations from smem
+            float4 a1 = *reinterpret_cast<const float4 *>(s_hidden + k);
+            float4 a2 = *reinterpret_cast<const float4 *>(s_hidden + k + 4);
+
+            #pragma unroll
+            for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+                if (!valid[r]) continue;
+
+                // Load 8 half weights (128-bit) from global memory
+                const half *w_row_ptr = weight + rows[r] * HIDDEN_SIZE + k;
+                uint4 w_u4 = ldg_load_weights_u4(reinterpret_cast<const uint4 *>(w_row_ptr));
+                const half2 *w_h2 = reinterpret_cast<const half2 *>(&w_u4);
+
+                // Vectorized half2 to float2 conversion (2x faster than individual)
+                float2 wf0 = __half22float2(w_h2[0]);
+                float2 wf1 = __half22float2(w_h2[1]);
+                float2 wf2 = __half22float2(w_h2[2]);
+                float2 wf3 = __half22float2(w_h2[3]);
+
+                // Turing doesn't have fast BF16, so we compute in FP32
+                sum[r] += wf0.x * a1.x + wf0.y * a1.y +
+                          wf1.x * a1.z + wf1.y * a1.w +
+                          wf2.x * a2.x + wf2.y * a2.y +
+                          wf3.x * a2.z + wf3.y * a2.w;
+            }
+        }
+
+        #pragma unroll
+        for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+            if (!valid[r]) continue;
+            float reduced = ldg_warp_reduce_sum(sum[r]);
+            if (lane_id == 0 && reduced > local_max) {
+                local_max = reduced;
+                local_max_idx = rows[r];
+            }
+        }
+    }
+
+    // Warp-level reduction for the whole block
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, local_max, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
+        if (other_val > local_max) {
+            local_max = other_val;
+            local_max_idx = other_idx;
+        }
+    }
+    // Broadcast lane 0's result to all lanes (FIX: ensures all lanes have correct values)
+    local_max = __shfl_sync(0xffffffff, local_max, 0);
+    local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+
+    __shared__ struct { float val; int idx; } block_shared[LDG_LM_BLOCK_SIZE / WARP_SIZE];
+
+    if (lane_id == 0) {
+        block_shared[warp_id].val = local_max;
+        block_shared[warp_id].idx = local_max_idx;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float final_max = (lane_id < (LDG_LM_BLOCK_SIZE / WARP_SIZE)) ? block_shared[lane_id].val : -INFINITY;
+        int final_idx = (lane_id < (LDG_LM_BLOCK_SIZE / WARP_SIZE)) ? block_shared[lane_id].idx : -1;
+
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            float v = __shfl_down_sync(0xffffffff, final_max, offset);
+            int i = __shfl_down_sync(0xffffffff, final_idx, offset);
+            if (v > final_max) {
+                final_max = v;
+                final_idx = i;
+            }
+        }
+        if (lane_id == 0) {
+            block_max_vals[blockIdx.x] = final_max;
+            block_max_idxs[blockIdx.x] = final_idx;
+        }
+    }
+
+    // GLOBAL SYNC AND FINAL ARGMAX
+    // WARNING: This spin-wait is still dangerous on GTX 1650 with 1184 blocks
+    // Consider using cooperative groups or splitting into 2 kernels for production
+    
+    if (threadIdx.x == 0) {
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+        atomicAdd(counter, 1);
+    }
+
+    // Only Block 0 performs the final reduction
+    if (blockIdx.x == 0) {
+        if (threadIdx.x == 0) {
+            volatile unsigned int *v_counter = counter;
+            while (*v_counter < (unsigned int)num_blocks) { /* Spin wait */ }
+        }
+        __syncthreads();
+
+        __shared__ struct { float val; int idx; } s_final[1024];
+
+        float g_max = -INFINITY;
+        int g_idx = -1;
+
+        // Loop over the block results (tiling if num_blocks > 1024)
+        for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
+            float val = block_max_vals[i];
+            if (val > g_max) {
+                g_max = val;
+                g_idx = block_max_idxs[i];
+            }
+        }
+
+        s_final[threadIdx.x].val = g_max;
+        s_final[threadIdx.x].idx = g_idx;
+        __syncthreads();
+
+        // Standard tree reduction
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                if (s_final[threadIdx.x + s].val > s_final[threadIdx.x].val) {
+                    s_final[threadIdx.x] = s_final[threadIdx.x + s];
+                }
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            *output_token = s_final[0].idx;
+        }
+    }
+}
