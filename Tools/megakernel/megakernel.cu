@@ -19,6 +19,20 @@ constexpr int HEAD_DIM = 128;
 constexpr int Q_SIZE = NUM_Q_HEADS * HEAD_DIM;   // 2048
 constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 
+struct LDGLayerWeights {
+  const half *input_layernorm_weight;
+  const half *q_proj_weight;
+  const half *k_proj_weight;
+  const half *v_proj_weight;
+  const half *q_norm_weight;
+  const half *k_norm_weight;
+  const half *o_proj_weight;
+  const half *post_attn_layernorm_weight;
+  const half *gate_proj_weight;
+  const half *up_proj_weight;
+  const half *down_proj_weight;
+};
+
 #ifndef LDG_NUM_BLOCKS
 #define LDG_NUM_BLOCK 28
 #endif
@@ -628,30 +642,105 @@ __device__ void ldg_o_proj_postnorm_mlp(
     }
     grid.sync();
 }
-/**
- * Fused LM Head Kernel (ArgMax) Optimized for GTX 1650 (sm_75)
- */
-__global__ void ldg_lm_head_fused(
-    const float *__restrict__ hidden,
-    const half *__restrict__ weight,    
-    float *__restrict__ block_max_vals,
-    int *__restrict__ block_max_idxs,
-    int *__restrict__ output_token,
-    unsigned int *__restrict__ counter,
-    int num_blocks) 
-{
-    // BLOCK-LOCAL MAX CALCULATION
-    __shared__ __align__(128) float s_hidden[HIDDEN_SIZE];
 
+// Global variables and helper functions for persistent kernel infrastructure
+
+static unsigned int *d_barrier_counter = nullptr;
+static unsigned int *d_barrier_sense = nullptr;
+static unsigned int *d_kv_flag = nullptr;
+static unsigned int *d_attn_flag = nullptr;
+static int *d_mutable_position = nullptr;
+static int *d_mutable_token_id = nullptr;
+static int *h_pinned_position = nullptr;
+static int *h_pinned_token_id = nullptr;
+
+static void ensure_barrier_alloc() {
+  if (!d_barrier_counter) {
+    cudaMalloc(&d_barrier_counter, sizeof(unsigned int));
+    cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
+    cudaMalloc(&d_kv_flag, sizeof(unsigned int));
+    cudaMalloc(&d_attn_flag, sizeof(unsigned int));
+    cudaMalloc(&d_mutable_position, sizeof(int));
+    cudaMalloc(&d_mutable_token_id, sizeof(int));
+    cudaHostAlloc(&h_pinned_position, sizeof(int), cudaHostAllocDefault);
+    cudaHostAlloc(&h_pinned_token_id, sizeof(int), cudaHostAllocDefault);
+    cudaMemset(d_barrier_counter, 0, sizeof(unsigned int));
+    cudaMemset(d_barrier_sense, 0, sizeof(unsigned int));
+    cudaMemset(d_kv_flag, 0, sizeof(unsigned int));
+    cudaMemset(d_attn_flag, 0, sizeof(unsigned int));
+  }
+}
+
+// Device-side step update kernel
+__global__ void ldg_update_step(
+    const int *__restrict__ lm_output,
+    int *__restrict__ d_token_id,
+    int *__restrict__ d_position,
+    int *__restrict__ output_log,
+    int *__restrict__ d_step_counter) {
+  int tok = *lm_output;
+  int step = *d_step_counter;
+  *d_token_id = tok;
+  *d_position = *d_position + 1;
+  output_log[step] = tok;
+  *d_step_counter = step + 1;
+}
+
+// Forward declarations
+static inline void ldg_configure_kernel_attributes();
+
+// Decoder kernels (must be defined in your main file)
+__global__ void ldg_decode_kernel_direct(
+    const half *embed_weight,
+    const LDGLayerWeights *layer_weights,
+    const half *final_norm_weight,
+    const half *cos_table,
+    const half *sin_table,
+    half *k_cache, half *v_cache,
+    half *hidden_buffer,
+    float *g_activations, float *g_residual,
+    float *g_q, float *g_k, float *g_v,
+    float *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
+    unsigned int *barrier_counter, unsigned int *barrier_sense,
+    unsigned int *kv_flag, unsigned int *attn_flag,
+    int num_layers, int position, int input_token_id,
+    int max_seq_len, float attn_scale);
+
+__global__ void ldg_decode_kernel_persistent(
+    const half *embed_weight,
+    const LDGLayerWeights *layer_weights,
+    const half *final_norm_weight,
+    const half *cos_table,
+    const half *sin_table,
+    half *k_cache, half *v_cache,
+    half *hidden_buffer,
+    float *g_activations, float *g_residual,
+    float *g_q, float *g_k, float *g_v,
+    float *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
+    unsigned int *barrier_counter, unsigned int *barrier_sense,
+    unsigned int *kv_flag, unsigned int *attn_flag,
+    int num_layers, const int *d_position,
+    const int *d_token_id, int max_seq_len, float attn_scale);
+
+/**
+ * Phase 1: Distributed vocab projection and block-level argmax
+ */
+__global__ void __launch_bounds__(LDG_LM_BLOCK_SIZE, 1) ldg_lm_head_phase1(
+    const float *__restrict__ normalized,
+    const half *__restrict__ weight,
+    float *__restrict__ block_max_vals,
+    int *__restrict__ block_max_idxs)
+{
+    __shared__ __align__(128) float s_hidden[HIDDEN_SIZE];
+    
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_LM_BLOCK_SIZE) {
-        s_hidden[i] = hidden[i];
+        s_hidden[i] = normalized[i];
     }
     __syncthreads();
 
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
 
-    // Vocabulary partitioning across blocks
     int rows_per_block = (LDG_VOCAB_SIZE + gridDim.x - 1) / gridDim.x;
     int row_start = blockIdx.x * rows_per_block;
     int row_end = min(row_start + rows_per_block, LDG_VOCAB_SIZE);
@@ -665,21 +754,17 @@ __global__ void ldg_lm_head_fused(
     for (int m_base = base; m_base < row_end; m_base += warp_stride * LDG_LM_ROWS_PER_WARP) {
         int rows[LDG_LM_ROWS_PER_WARP];
         bool valid[LDG_LM_ROWS_PER_WARP];
-        
+        float sum[LDG_LM_ROWS_PER_WARP];
+
         #pragma unroll
         for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
             rows[r] = m_base + r;
             valid[r] = rows[r] < row_end;
+            sum[r] = 0.0f;
         }
 
-        float sum[LDG_LM_ROWS_PER_WARP];
-        #pragma unroll
-        for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) sum[r] = 0.0f;
-
-        // Optimized dot product using 128-bit loads
         #pragma unroll 4
         for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
-            // Load 8 float activations from smem
             float4 a1 = *reinterpret_cast<const float4 *>(s_hidden + k);
             float4 a2 = *reinterpret_cast<const float4 *>(s_hidden + k + 4);
 
@@ -687,18 +772,15 @@ __global__ void ldg_lm_head_fused(
             for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
                 if (!valid[r]) continue;
 
-                // Load 8 half weights (128-bit) from global memory
                 const half *w_row_ptr = weight + rows[r] * HIDDEN_SIZE + k;
                 uint4 w_u4 = ldg_load_weights_u4(reinterpret_cast<const uint4 *>(w_row_ptr));
                 const half2 *w_h2 = reinterpret_cast<const half2 *>(&w_u4);
 
-                // Vectorized half2 to float2 conversion (2x faster than individual)
                 float2 wf0 = __half22float2(w_h2[0]);
                 float2 wf1 = __half22float2(w_h2[1]);
                 float2 wf2 = __half22float2(w_h2[2]);
                 float2 wf3 = __half22float2(w_h2[3]);
 
-                // Turing doesn't have fast BF16, so we compute in FP32
                 sum[r] += wf0.x * a1.x + wf0.y * a1.y +
                           wf1.x * a1.z + wf1.y * a1.w +
                           wf2.x * a2.x + wf2.y * a2.y +
@@ -717,7 +799,6 @@ __global__ void ldg_lm_head_fused(
         }
     }
 
-    // Warp-level reduction for the whole block
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
         float other_val = __shfl_down_sync(0xffffffff, local_max, offset);
         int other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
@@ -726,21 +807,21 @@ __global__ void ldg_lm_head_fused(
             local_max_idx = other_idx;
         }
     }
-    // Broadcast lane 0's result to all lanes (FIX: ensures all lanes have correct values)
     local_max = __shfl_sync(0xffffffff, local_max, 0);
     local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
 
-    __shared__ struct { float val; int idx; } block_shared[LDG_LM_BLOCK_SIZE / WARP_SIZE];
+    __shared__ struct { float val; int idx; } s_warp_max[LDG_LM_BLOCK_SIZE / WARP_SIZE];
 
     if (lane_id == 0) {
-        block_shared[warp_id].val = local_max;
-        block_shared[warp_id].idx = local_max_idx;
+        s_warp_max[warp_id].val = local_max;
+        s_warp_max[warp_id].idx = local_max_idx;
     }
     __syncthreads();
 
     if (warp_id == 0) {
-        float final_max = (lane_id < (LDG_LM_BLOCK_SIZE / WARP_SIZE)) ? block_shared[lane_id].val : -INFINITY;
-        int final_idx = (lane_id < (LDG_LM_BLOCK_SIZE / WARP_SIZE)) ? block_shared[lane_id].idx : -1;
+        int num_warps = LDG_LM_BLOCK_SIZE / WARP_SIZE;
+        float final_max = (lane_id < num_warps) ? s_warp_max[lane_id].val : -INFINITY;
+        int final_idx = (lane_id < num_warps) ? s_warp_max[lane_id].idx : -1;
 
         for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
             float v = __shfl_down_sync(0xffffffff, final_max, offset);
@@ -750,59 +831,209 @@ __global__ void ldg_lm_head_fused(
                 final_idx = i;
             }
         }
+
         if (lane_id == 0) {
             block_max_vals[blockIdx.x] = final_max;
             block_max_idxs[blockIdx.x] = final_idx;
         }
     }
+}
 
-    // GLOBAL SYNC AND FINAL ARGMAX
-    // WARNING: This spin-wait is still dangerous on GTX 1650 with 1184 blocks
-    // Consider using cooperative groups or splitting into 2 kernels for production
-    
+/**
+ * Phase 2: Global argmax reduction
+ */
+__global__ void __launch_bounds__(LDG_LM_BLOCK_SIZE, 1) ldg_lm_head_phase2(
+    const float *__restrict__ block_max_vals,
+    const int *__restrict__ block_max_idxs,
+    int *__restrict__ output_token,
+    int num_blocks)
+{
+    __shared__ struct { float val; int idx; } s_data[LDG_LM_BLOCK_SIZE];
+
+    float thread_max = -INFINITY;
+    int thread_idx = -1;
+
+    for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
+        float val = block_max_vals[i];
+        if (val > thread_max) {
+            thread_max = val;
+            thread_idx = block_max_idxs[i];
+        }
+    }
+
+    s_data[threadIdx.x].val = thread_max;
+    s_data[threadIdx.x].idx = thread_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            if (s_data[threadIdx.x + stride].val > s_data[threadIdx.x].val) {
+                s_data[threadIdx.x] = s_data[threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+
     if (threadIdx.x == 0) {
-        asm volatile("fence.acq_rel.gpu;" ::: "memory");
-        atomicAdd(counter, 1);
+        *output_token = s_data[0].idx;
     }
+}
 
-    // Only Block 0 performs the final reduction
-    if (blockIdx.x == 0) {
-        if (threadIdx.x == 0) {
-            volatile unsigned int *v_counter = counter;
-            while (*v_counter < (unsigned int)num_blocks) { /* Spin wait */ }
-        }
-        __syncthreads();
+// Launch functions
 
-        __shared__ struct { float val; int idx; } s_final[1024];
+extern "C" void launch_ldg_decode_direct(
+    int input_token_id, int *output_token_id, const void *embed_weight,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int num_layers, int position, int max_seq_len,
+    float attn_scale, cudaStream_t stream) {
+  
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
 
-        float g_max = -INFINITY;
-        int g_idx = -1;
+  ldg_decode_kernel_direct<<<LDG_NUM_BLOCK, LDG_BLOCK_SIZE, 0, stream>>>(
+      (const half *)embed_weight, layer_weights,
+      (const half *)final_norm_weight,
+      (const half *)cos_table, (const half *)sin_table,
+      (half *)k_cache, (half *)v_cache,
+      (half *)hidden_buffer, (float *)g_activations,
+      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      position, input_token_id, max_seq_len, attn_scale);
 
-        // Loop over the block results (tiling if num_blocks > 1024)
-        for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
-            float val = block_max_vals[i];
-            if (val > g_max) {
-                g_max = val;
-                g_idx = block_max_idxs[i];
-            }
-        }
+  ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+      (const float *)g_normalized, 
+      (const half *)lm_head_weight,
+      (float *)block_max_vals, 
+      (int *)block_max_idxs);
 
-        s_final[threadIdx.x].val = g_max;
-        s_final[threadIdx.x].idx = g_idx;
-        __syncthreads();
+  ldg_lm_head_phase2<<<1, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+      (const float *)block_max_vals,
+      (const int *)block_max_idxs,
+      output_token_id,
+      LDG_LM_NUM_BLOCKS);
+}
 
-        // Standard tree reduction
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) {
-                if (s_final[threadIdx.x + s].val > s_final[threadIdx.x].val) {
-                    s_final[threadIdx.x] = s_final[threadIdx.x + s];
-                }
-            }
-            __syncthreads();
-        }
+extern "C" void launch_ldg_decode_persistent(
+    int input_token_id, int *output_token_id, const void *embed_weight,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int num_layers, int position, int cache_len,
+    int max_seq_len, float attn_scale, cudaStream_t stream) {
+  
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
 
-        if (threadIdx.x == 0) {
-            *output_token = s_final[0].idx;
-        }
-    }
+  *h_pinned_position = position;
+  *h_pinned_token_id = input_token_id;
+  cudaMemcpyAsync(d_mutable_position, h_pinned_position, sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+
+  ldg_decode_kernel_persistent<<<LDG_NUM_BLOCK, LDG_BLOCK_SIZE, 0, stream>>>(
+      (const half *)embed_weight, layer_weights,
+      (const half *)final_norm_weight,
+      (const half *)cos_table, (const half *)sin_table,
+      (half *)k_cache, (half *)v_cache,
+      (half *)hidden_buffer, (float *)g_activations,
+      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
+
+  ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+      (const float *)g_normalized,
+      (const half *)lm_head_weight,
+      (float *)block_max_vals,
+      (int *)block_max_idxs);
+
+  ldg_lm_head_phase2<<<1, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+      (const float *)block_max_vals,
+      (const int *)block_max_idxs,
+      output_token_id,
+      LDG_LM_NUM_BLOCKS);
+}
+
+extern "C" void launch_ldg_generate_nosync(
+    int first_token_id, int num_steps, const void *embed_weight,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int *output_log, 
+    int num_layers, int start_position, int max_seq_len, float attn_scale,
+    cudaStream_t stream) {
+
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+
+  static int *d_step_counter = nullptr;
+  static int *d_output_token = nullptr;
+  if (!d_step_counter) {
+    cudaMalloc(&d_step_counter, sizeof(int));
+    cudaMalloc(&d_output_token, sizeof(int));
+  }
+  cudaMemsetAsync(d_step_counter, 0, sizeof(int), stream);
+
+  *h_pinned_position = start_position;
+  *h_pinned_token_id = first_token_id;
+  cudaMemcpyAsync(d_mutable_position, h_pinned_position, sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+
+  for (int step = 0; step < num_steps; step++) {
+    ldg_decode_kernel_persistent<<<LDG_NUM_BLOCK, LDG_BLOCK_SIZE, 0, stream>>>(
+        (const half *)embed_weight, layer_weights,
+        (const half *)final_norm_weight,
+        (const half *)cos_table, (const half *)sin_table,
+        (half *)k_cache, (half *)v_cache,
+        (half *)hidden_buffer, (float *)g_activations,
+        (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+        (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+        d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+        d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
+
+    ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+        (const float *)g_normalized,
+        (const half *)lm_head_weight,
+        (float *)block_max_vals,
+        (int *)block_max_idxs);
+
+    ldg_lm_head_phase2<<<1, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+        (const float *)block_max_vals,
+        (const int *)block_max_idxs,
+        d_output_token,
+        LDG_LM_NUM_BLOCKS);
+
+    ldg_update_step<<<1, 1, 0, stream>>>(
+        d_output_token, d_mutable_token_id,
+        d_mutable_position, output_log,
+        d_step_counter);
+  }
+}
+
+static inline void ldg_configure_kernel_attributes() {
+  static bool configured = false;
+  if (configured) return;
+  configured = true;
+  
+  cudaFuncSetAttribute(ldg_decode_kernel_persistent,
+                       cudaFuncAttributePreferredSharedMemoryCarveout,
+                       cudaSharedmemCarveoutMaxShared);
+  cudaFuncSetAttribute(ldg_lm_head_phase1,
+                       cudaFuncAttributePreferredSharedMemoryCarveout,
+                       cudaSharedmemCarveoutMaxL1);
+  cudaFuncSetAttribute(ldg_lm_head_phase2,
+                       cudaFuncAttributePreferredSharedMemoryCarveout,
+                       cudaSharedmemCarveoutMaxL1);
 }
