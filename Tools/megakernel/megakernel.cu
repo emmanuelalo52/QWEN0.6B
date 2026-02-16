@@ -630,7 +630,6 @@ __device__ void ldg_o_proj_postnorm_mlp(
 }
 /**
  * Fused LM Head Kernel (ArgMax) Optimized for GTX 1650 (sm_75)
- * Requirements: HIDDEN_SIZE must be a multiple of 8 for uint4 alignment.
  */
 __global__ void ldg_lm_head_fused(
     const float *__restrict__ hidden,
