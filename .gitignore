@@ -1,0 +1,5 @@
+/.vscode
+/build
+/cuda_extensions.egg-info
+/dist
+/setup.py
