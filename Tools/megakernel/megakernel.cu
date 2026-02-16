@@ -295,3 +295,179 @@ __device__ void ldg_prefetch_weights_l2(const half* weights, int num_elements) {
         asm volatile("" : : "r"(dummy_vec.x), "r"(dummy_vec.y), "r"(dummy_vec.z), "r"(dummy_vec.w));
     }
 }
+
+__device__ void ldg_attention(
+    AtomicGridSync &grid, 
+    half* q, 
+    half* k, 
+    const half* v, 
+    half* k_cache, 
+    half* v_cache, 
+    half* attn_out,
+    int cache_len, 
+    int max_seq_len, 
+    float attn_scale,
+    const half* q_norm_weight, 
+    const half* k_norm_weight,
+    const half* cos_table, 
+    const half* sin_table, 
+    int position,
+    // Weights for prefetching
+    const half* o_w, 
+    const half* g_w, 
+    const half* u_w, 
+    const half* d_w
+){
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    const half* cos_pos = cos_table + position * HEAD_DIM;
+    const half* sin_pos = sin_table + position * HEAD_DIM;
+
+    // QK Norm & RoPE (Fused)
+    // Handles K norm + RoPE + Cache write (Block 0)
+    if(block_id == 0){
+        for(int h = warp_id; h < NUM_KV_HEADS; h += LDG_NUM_WARPS){
+            half* k_ptr = k + h * HEAD_DIM;
+            half* kc_ptr = k_cache + h * max_seq_len * HEAD_DIM + position * HEAD_DIM;
+            half* vc_ptr = v_cache + h * max_seq_len * HEAD_DIM + position * HEAD_DIM;
+
+            float ss = 0.0f;
+            for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE){
+                float val = __half2float(k_ptr[i]);
+                ss += val * val;
+            }
+            ss = ldg_warp_reduce_sum(ss);
+            float inv_rms = rsqrtf(ss / (float)HEAD_DIM + 1e-6f);
+            inv_rms = __shfl_sync(0xffffffff, inv_rms, 0);
+
+            for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE){
+                float k_val = __half2float(k_ptr[i]) * inv_rms * __half2float(k_norm_weight[i]);
+                float c = __half2float(cos_pos[i]);
+                float s = __half2float(sin_pos[i]);
+                
+                // RoPE: [x, y] -> [x*c - y*s, x*s + y*c] using half-dim swap
+                int po = (i < HEAD_DIM / 2) ? (HEAD_DIM / 2) : -(HEAD_DIM / 2);
+                float k_neighbor = __shfl_xor_sync(0xffffffff, k_val, 16);
+                float k_rot = (i < HEAD_DIM / 2) ? (k_val * c - __shfl_sync(0xffffffff, k_val, lane_id + 16) * s) : (k_val * c + __shfl_sync(0xffffffff, k_val, lane_id - 16) * s);
+                
+                kc_ptr[i] = __float2half(k_rot);
+                vc_ptr[i] = v[h * HEAD_DIM + i];
+            }
+        }
+    }
+
+    // Handle Q norm + RoPE
+    if(block_id < LDG_ATTN_BOCKS && warp_id == 0){
+        int heads_per_block = (NUM_Q_HEADS + LDG_ATTN_BOCKS - 1) / LDG_ATTN_BOCKS;
+        int q_start = block_id * heads_per_block;
+        int q_end = min(q_start + heads_per_block, NUM_Q_HEADS);
+
+        for(int qh = q_start; qh < q_end; qh++){
+            half* q_ptr = q + qh * HEAD_DIM;
+            float ss = 0.0f;
+            for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE) {
+                float v = __half2float(q_ptr[i]);
+                ss += v * v;
+            }
+            ss = ldg_warp_reduce_sum(ss);
+            float inv_rms = rsqrtf(ss / (float)HEAD_DIM + 1e-6f);
+            inv_rms = __shfl_sync(0xffffffff, inv_rms, 0);
+
+            for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE){
+                float q_val = __half2float(q_ptr[i]) * inv_rms * __half2float(q_norm_weight[i]);
+                float c = __half2float(cos_pos[i]);
+                float s = __half2float(sin_pos[i]);
+                float q_rot = (i < HEAD_DIM / 2) ? (q_val * c - __shfl_xor_sync(0xffffffff, q_val, 16) * s) : (q_val * c + __shfl_xor_sync(0xffffffff, q_val, 16) * s);
+                q_ptr[i] = __float2half(q_rot);
+            }
+        }
+    }
+
+    // Prefetching (Idle Blocks)
+    if (block_id >= LDG_ATTN_BOCKS) {
+        int prefetch_id = block_id - LDG_ATTN_BOCKS;
+        int num_prefetch_blocks = LDG_NUM_BLOCK - LDG_ATTN_BOCKS;
+        // Divide weights across remaining blocks to warm L2 cache
+        int total_elements = (HIDDEN_SIZE * Q_SIZE) + (HIDDEN_SIZE * INTERMEDIATE_SIZE * 3); 
+        int per_block = (total_elements + num_prefetch_blocks - 1) / num_prefetch_blocks;
+        int start = prefetch_id * per_block;
+        int end = min(start + per_block, total_elements);
+        
+        for (int i = start + threadIdx.x; i < end; i += LDG_BLOCK_SIZE) {
+            // Casting to void* to use generic prefetch PTX
+            const half* ptr = (i < HIDDEN_SIZE * Q_SIZE) ? (o_w + i) : (g_w + (i - HIDDEN_SIZE * Q_SIZE));
+            __builtin_prefetch(ptr, 0, 0); // L2 prefetch
+        }
+    }
+
+    grid.sync();
+
+    // Attention Computation
+    __shared__ float s_max_score[LDG_NUM_WARPS];
+    __shared__ float s_sum_exp[LDG_NUM_WARPS];
+    __shared__ float s_out_acc[LDG_NUM_WARPS][HEAD_DIM];
+
+    if(block_id < LDG_ATTN_BOCKS){
+        int heads_per_block = (NUM_Q_HEADS + LDG_ATTN_BOCKS - 1) / LDG_ATTN_BOCKS;
+        int q_start = block_id * heads_per_block;
+        int q_end = min(q_start + heads_per_block, NUM_Q_HEADS);
+
+        for(int qh = q_start; qh < q_end; qh++){
+            half* q_head = q + qh * HEAD_DIM;
+            int kv_head  = qh / (NUM_Q_HEADS / NUM_KV_HEADS);
+            
+            float max_score = -INFINITY;
+            float sum_exp = 0.0f;
+            float acc[4] = {0.0f}; // Local accumulation for 4 elements per thread
+
+            for(int t = warp_id; t < cache_len; t += LDG_NUM_WARPS){
+                half* kc = k_cache + kv_head * max_seq_len * HEAD_DIM + t * HEAD_DIM;
+                float score = 0.0f;
+                #pragma unroll
+                for(int i = lane_id; i < HEAD_DIM; i += 32) score += __half2float(q_head[i]) * __half2float(kc[i]);
+                score = ldg_warp_reduce_sum(score) * attn_scale;
+                score = __shfl_sync(0xffffffff, score, 0);
+
+                float old_max = max_score;
+                max_score = fmaxf(max_score, score);
+                float e = expf(score - max_score);
+                float e_old = expf(old_max - max_score);
+                sum_exp = sum_exp * e_old + e;
+
+                half* vc = v_cache + kv_head * max_seq_len * HEAD_DIM + t * HEAD_DIM;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) acc[i] = acc[i] * e_old + e * __half2float(vc[lane_id + i * 32]);
+            }
+
+            // Final Reduction across warps
+            if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
+            #pragma unroll
+            for (int i = 0; i < 4; i++) s_out_acc[warp_id][lane_id + i * 32] = acc[i];
+            __syncthreads();
+
+            if (warp_id == 0) {
+                float global_max = s_max_score[0];
+                for (int w = 1; w < LDG_NUM_WARPS; w++) global_max = fmaxf(global_max, s_max_score[w]);
+                
+                float total_sum = 0.0f;
+                float final_acc[4] = {0.0f};
+                for (int w = 0; w < LDG_NUM_WARPS; w++) {
+                    float scale = expf(s_max_score[w] - global_max);
+                    total_sum += s_sum_exp[w] * scale;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) final_acc[i] += s_out_acc[w][lane_id + i * 32] * scale;
+                }
+                
+                half* out_head = attn_out + qh * HEAD_DIM;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) out_head[lane_id + i * 32] = __float2half(final_acc[i] / total_sum);
+            }
+            __syncthreads();
+        }
+    }
+    grid.sync();
+}
+
+// O projection + Residual + PostNorm + MLP(_ldg)
