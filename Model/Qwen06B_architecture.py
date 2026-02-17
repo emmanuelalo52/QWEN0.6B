@@ -1,10 +1,22 @@
 """Weight loading and high-level decode API for Qwen3-0.6B."""
 
+<<<<<<< HEAD
 import math
 import struct
 
 import torch
 
+=======
+import math
+import struct
+
+import torch
+
+try:
+    import qwen_megakernel_C
+except ImportError:
+    qwen_megakernel_C = None
+>>>>>>> 45ac328682d979f4c7fdabe78ea6f8c39bf8b684
 
 NUM_LAYERS = 28
 NUM_KV_HEADS = 8
@@ -16,6 +28,7 @@ KV_SIZE = 8 * HEAD_DIM  # 1024
 MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
+<<<<<<< HEAD
 
 def _require_megakernel_op(op_name: str):
     """Return an op from torch.ops.qwen_megakernel_C or raise a clear error."""
@@ -33,6 +46,43 @@ def _require_megakernel_op(op_name: str):
 
 import qwen_megakernel_C
 _decode = qwen_megakernel_C.decode
+=======
+
+def _require_megakernel_op(op_name: str):
+    """Return an op from the extension module or torch.ops namespace."""
+    if qwen_megakernel_C is not None and hasattr(qwen_megakernel_C, op_name):
+        return getattr(qwen_megakernel_C, op_name)
+
+    namespace = getattr(torch.ops, "qwen_megakernel_C", None)
+    if namespace is not None and hasattr(namespace, op_name):
+        return getattr(namespace, op_name)
+
+    available_ops = []
+    if qwen_megakernel_C is not None:
+        available_ops.extend(
+            op for op in ("decode", "generate_nosync") if hasattr(qwen_megakernel_C, op)
+        )
+    if namespace is not None:
+        available_ops.extend(
+            op for op in ("decode", "generate_nosync") if hasattr(namespace, op)
+        )
+    if not available_ops:
+        available_ops_text = "none"
+    else:
+        available_ops_text = ", ".join(sorted(set(available_ops)))
+
+    raise RuntimeError(
+        "qwen_megakernel_C op '"
+        f"{op_name}"
+        "' is unavailable. The C++/CUDA extension is not loaded for this "
+        "PyTorch build. Rebuild/install the megakernel extension against your "
+        f"current torch version ({torch.__version__}). Available extension ops: "
+        f"{available_ops_text}."
+    )
+
+
+_decode = _require_megakernel_op("decode")
+>>>>>>> 45ac328682d979f4c7fdabe78ea6f8c39bf8b684
 
 
 def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
