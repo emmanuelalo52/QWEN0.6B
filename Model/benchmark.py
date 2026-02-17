@@ -19,9 +19,17 @@ RUN_CORRECTNESS = True
 def megakernel_available() -> tuple[bool, str]:
     try:
         import qwen_megakernel_C
+
         missing = [op for op in ("decode", "generate_nosync") if not hasattr(qwen_megakernel_C, op)]
         if missing:
             return False, f"missing ops: {', '.join(missing)}"
+
+        abi_version = getattr(qwen_megakernel_C, "abi_version", None)
+        if abi_version is None:
+            return False, "stale extension binary: missing abi_version() marker"
+        if int(abi_version()) != 2:
+            return False, f"stale extension ABI: expected 2, got {int(abi_version())}"
+
         return True, "ok"
     except ImportError as e:
         return False, str(e)

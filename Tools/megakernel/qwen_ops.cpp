@@ -156,4 +156,9 @@ torch::Tensor generate_nosync(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode", &decode, "Qwen3 single token decode");
     m.def("generate_nosync", &generate_nosync, "Qwen3 batched generation");
+    // Export a tiny ABI marker so Python can reject stale extension binaries.
+    // Bump this whenever pointer packing or kernel argument conventions change.
+    m.def("abi_version", []() { return 2; }, "Megakernel extension ABI version");
+    m.def("built_torch_version", []() { return std::string(TORCH_VERSION); },
+          "Torch version used when building this extension");
 }
