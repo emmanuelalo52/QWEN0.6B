@@ -2,6 +2,7 @@
 
 import math
 import torch
+import os
 
 try:
     import qwen_megakernel_C
@@ -127,14 +128,37 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
 
 
 def _pack_layer_weights(layer_weights: list[torch.Tensor]) -> torch.Tensor:
-    n_ptrs = 11
+    ptrs: list[int] = []
+    """Pack per-layer weight pointers to match LDGLayerWeight in CUDA.
+
+    By default we emit 12 pointers/layer (11 real pointers + 1 padding slot)
+    because `LDGLayerWeight` in `megakernel.cu` includes a trailing padding
+    field for ABI-safe 16-byte alignment.
+
+    Set `QWEN_MEGAKERNEL_PTRS_PER_LAYER=11` only as a temporary compatibility
+    workaround when running against an older extension binary.
+    """
+    ptrs_per_layer = int(os.environ.get("QWEN_MEGAKERNEL_PTRS_PER_LAYER", "12"))
+    if ptrs_per_layer not in (11, 12):
+        raise ValueError(
+            "QWEN_MEGAKERNEL_PTRS_PER_LAYER must be 11 or 12, "
+            f"got {ptrs_per_layer}."
+        )
+
+    real_ptrs_per_layer = 11
     ptrs: list[int] = []
     for i in range(NUM_LAYERS):
-        for j in range(n_ptrs):
-            ptrs.append(layer_weights[i * n_ptrs + j].data_ptr())
-        
-        # --- FIX: Insert Padding ---
-        ptrs.append(0)  # <--- ADD THIS LINE
+        base = i * real_ptrs_per_layer
+        for j in range(real_ptrs_per_layer):
+            ptrs.append(layer_weights[base + j].data_ptr())
+
+        if ptrs_per_layer == 11:
+            # Extension ABI expects 11 fields/layer (legacy).
+            continue
+
+        # Extension ABI expects 12 fields/layer (current):
+        # 11 real pointers + 1 trailing padding pointer.
+        ptrs.append(0)
         
     return torch.tensor(ptrs, dtype=torch.int64, device="cuda").contiguous()
 
@@ -191,33 +215,49 @@ class Decoder:
 
     def step(self, token_id: int) -> int:
         """Decode one token. Returns the next token id."""
-        _decode(
-            self._out_token,
-            token_id,
-            self._embed_weight,
-            self._layer_weights_packed,
-            self._final_norm_weight,
-            self._lm_head_weight,
-            self._cos_table,
-            self._sin_table,
-            self._k_cache,
-            self._v_cache,
-            self._hidden,
-            self._act,
-            self._res,
-            self._q,
-            self._k,
-            self._v,
-            self._attn_out,
-            self._mlp_inter,
-            self._norm_out,
-            self._fmax_vals,
-            self._fmax_idxs,
-            NUM_LAYERS,
-            self._position,
-            MAX_SEQ_LEN,
-            self._attn_scale,
-        )
+        try:
+            _decode(
+                self._out_token,
+                token_id,
+                self._embed_weight,
+                self._layer_weights_packed,
+                self._final_norm_weight,
+                self._lm_head_weight,
+                self._cos_table,
+                self._sin_table,
+                self._k_cache,
+                self._v_cache,
+                self._hidden,
+                self._act,
+                self._res,
+                self._q,
+                self._k,
+                self._v,
+                self._attn_out,
+                self._mlp_inter,
+                self._norm_out,
+                self._fmax_vals,
+                self._fmax_idxs,
+                NUM_LAYERS,
+                self._position,
+                MAX_SEQ_LEN,
+                self._attn_scale,
+            )
+            # Surface kernel faults at the actual callsite; CUDA reports async
+            # errors late by default which hides the true source.
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            if "misaligned address" in str(e).lower():
+                raise RuntimeError(
+                    "CUDA misaligned address during megakernel decode. "
+                    "This usually indicates an ABI mismatch between Python "
+                    "pointer packing and the compiled qwen_megakernel_C binary "
+                    "(stale extension after source changes). Rebuild the CUDA "
+                    "extension against the current source and torch build. "
+                    "If you must run against an older binary, try "
+                    "QWEN_MEGAKERNEL_PTRS_PER_LAYER=11 as a temporary fallback."
+                ) from e
+            raise
         self._position += 1
         return self._out_token.item()
 
