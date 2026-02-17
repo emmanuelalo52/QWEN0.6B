@@ -17,12 +17,29 @@ RUN_CORRECTNESS = True
 
 
 def megakernel_available() -> tuple[bool, str]:
+    import importlib
+
+    module = None
+    try:
+        module = importlib.import_module("qwen_megakernel_C")
+    except ImportError:
+        pass
+
     namespace = getattr(torch.ops, "qwen_megakernel_C", None)
-    if namespace is None:
-        return False, "torch.ops.qwen_megakernel_C namespace is missing"
-    missing = [op for op in ("decode", "generate_nosync") if not hasattr(namespace, op)]
+
+    def has_op(op: str) -> bool:
+        return (module is not None and hasattr(module, op)) or (
+            namespace is not None and hasattr(namespace, op)
+        )
+
+    missing = [op for op in ("decode", "generate_nosync") if not has_op(op)]
     if missing:
-        return False, f"missing ops: {', '.join(missing)}"
+        details = []
+        if module is None:
+            details.append("python module not importable")
+        if namespace is None:
+            details.append("torch.ops namespace missing")
+        return False, f"missing ops: {', '.join(missing)} ({'; '.join(details)})"
     return True, "ok"
 
 
