@@ -160,41 +160,27 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
     return weights, tokenizer
 
 
-def _pack_layer_weights(layer_weights: list[torch.Tensor]) -> torch.Tensor:
-    ptrs: list[int] = []
-    """Pack per-layer weight pointers to match LDGLayerWeight in CUDA.
-
-    By default we emit 12 pointers/layer (11 real pointers + 1 padding slot)
-    because `LDGLayerWeight` in `megakernel.cu` includes a trailing padding
-    field for ABI-safe 16-byte alignment.
-
-    Set `QWEN_MEGAKERNEL_PTRS_PER_LAYER=11` only as a temporary compatibility
-    workaround when running against an older extension binary.
+def _pack_layer_weights(layer_weights: list) -> torch.Tensor:
     """
-    ptrs_per_layer = int(os.environ.get("QWEN_MEGAKERNEL_PTRS_PER_LAYER", "12"))
-    if ptrs_per_layer not in (11, 12):
-        raise ValueError(
-            "QWEN_MEGAKERNEL_PTRS_PER_LAYER must be 11 or 12, "
-            f"got {ptrs_per_layer}."
-        )
-
-    real_ptrs_per_layer = 11
-    ptrs: list[int] = []
-    for i in range(NUM_LAYERS):
-        base = i * real_ptrs_per_layer
-        for j in range(real_ptrs_per_layer):
-            ptrs.append(layer_weights[base + j].data_ptr())
-
-        if ptrs_per_layer == 11:
-            # Extension ABI expects 11 fields/layer (legacy).
-            continue
-
-        # Extension ABI expects 12 fields/layer (current):
-        # 11 real pointers + 1 trailing padding pointer.
-        ptrs.append(0)
-        
-    return torch.tensor(ptrs, dtype=torch.int64, device="cuda").contiguous()
-
+    Pack flat list of (NUM_LAYERS * 11) tensors into GPU LDGLayerWeight structs.
+    C struct: 11 half* + 1 void* padding = 12 x int64 = 96 bytes/layer.
+    layer_weights is FLAT: [layer0_w0..w10, layer1_w0..w10, ..., layer27_w0..w10]
+    """
+    N = 11
+    n_layers = len(layer_weights) // N
+    assert len(layer_weights) == n_layers * N, (
+        f"layer_weights length {len(layer_weights)} not divisible by {N}"
+    )
+    all_ptrs = []
+    for li in range(n_layers):
+        base = li * N
+        for j in range(N):
+            all_ptrs.append(layer_weights[base + j].data_ptr())
+        all_ptrs.append(0)  # 12th padding slot
+    t = torch.tensor(all_ptrs, dtype=torch.int64, device="cuda")
+    if t.data_ptr() % 16 != 0:
+        t = torch.tensor([0] + all_ptrs, dtype=torch.int64, device="cuda")[1:]
+    return t
 
 class Decoder:
     """Stateful decoder wrapping the Qwen megakernel ops."""
@@ -233,9 +219,10 @@ class Decoder:
         f32 = dict(dtype=torch.float32, device="cuda")
         i32 = dict(dtype=torch.int32,   device="cuda")
         self._hidden    = torch.empty(HIDDEN_SIZE,        **f16)
-        # These buffers are consumed as float* inside the CUDA megakernel.
+        # act/mlp_inter/norm_out are float32 (used as float* in kernel)
         self._act       = torch.empty(HIDDEN_SIZE,        **f32)
-        self._res       = torch.empty(HIDDEN_SIZE,        **f32)
+        # res is half - device_rmsnorm_step casts it to half* internally
+        self._res       = torch.empty(HIDDEN_SIZE,        **f16)
         self._q         = torch.empty(Q_SIZE,             **f16)
         self._k         = torch.empty(KV_SIZE,            **f16)
         self._v         = torch.empty(KV_SIZE,            **f16)
@@ -246,13 +233,15 @@ class Decoder:
         self._fmax_idxs = torch.empty(4096,               **i32)
         self._out_token = torch.empty(1,                  **i32)
 
-    def step(self, token_id: int) -> int:
-        """Decode one token. Returns the next token id."""
+    def step(self, input_token_id: int | torch.Tensor) -> int:
+        # ... (keep existing conversion code)
+        
         try:
-            _decode(
-                self._out_token,
-                token_id,
-                self._embed_weight,
+            # REMOVE self._out_token from the arguments
+            # CAPTURE the return value in a variable
+            result_tensor = _decode(
+                input_token_id,               # arg0: input_token_id
+                self._embed_weight,    # arg1: embed_weight (Corrected position)
                 self._layer_weights_packed,
                 self._final_norm_weight,
                 self._lm_head_weight,
@@ -276,24 +265,16 @@ class Decoder:
                 MAX_SEQ_LEN,
                 self._attn_scale,
             )
-            # Surface kernel faults at the actual callsite; CUDA reports async
-            # errors late by default which hides the true source.
             torch.cuda.synchronize()
+            
+            # Update the internal buffer if you still need it
+            self._out_token.copy_(result_tensor)
+            
         except RuntimeError as e:
-            if "misaligned address" in str(e).lower():
-                raise RuntimeError(
-                    "CUDA misaligned address during megakernel decode. "
-                    "This usually indicates an ABI mismatch between Python "
-                    "pointer packing and the compiled qwen_megakernel_C binary "
-                    "(stale extension after source changes). Rebuild the CUDA "
-                    "extension against the current source and torch build. "
-                    "If you must run against an older binary, try "
-                    "QWEN_MEGAKERNEL_PTRS_PER_LAYER=11 as a temporary fallback."
-                ) from e
-            raise
-        self._position += 1
-        return self._out_token.item()
+            raise e
 
+        self._position += 1
+        return int(result_tensor.item())
     def reset(self):
         self._position = 0
         self._k_cache.zero_()

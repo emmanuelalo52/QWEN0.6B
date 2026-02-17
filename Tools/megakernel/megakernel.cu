@@ -77,7 +77,7 @@ constexpr float LDG_RMS_EPS = 1e-6f;
 // LM_head
 constexpr int LDG_VOCAB_SIZE = 151936;
 
-struct LDGLayerWeight{
+struct __align__(16) LDGLayerWeight{
     const half* input_layernorm_weight;      // [HIDDEN_SIZE]
     const half* q_proj_weight;               // [Q_SIZE, HIDDEN_SIZE]
     const half* k_proj_weight;               // [KV_SIZE, HIDDEN_SIZE]
@@ -682,44 +682,83 @@ __device__ void ldg_decode_body(
     const half *cos_table,
     const half *sin_table,
     half *k_cache, half *v_cache,
-    half *hidden_buffer,
-    float *g_activations, float *g_residual,
+    half *hidden_buffer,           // half residual stream
+    float *g_activations,          // float scratch for o_proj
+    float *g_residual,             // float residual for o_proj add
     half *g_q, half *g_k, half *g_v,
-    half *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
+    half *g_attn_out,
+    float *g_mlp_intermediate,
+    float *g_normalized,
     int num_layers, int position, int input_token_id,
     int max_seq_len, float attn_scale,
     AtomicGridSync &grid)
 {
     int tid = threadIdx.x;
+    int lane_id = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
 
-    // 1. Embedding lookup -- block 0 writes residual, all blocks read it after sync
+    // ── 1. Embedding lookup ──────────────────────────────────────────────────
+    // Only block 0 writes; all blocks read after grid.sync().
     if (blockIdx.x == 0) {
         const half *embed_row = embed_weight + (long long)input_token_id * HIDDEN_SIZE;
         for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
             hidden_buffer[i] = embed_row[i];
-            g_residual[i]    = __half2float(embed_row[i]);
         }
     }
     grid.sync();
 
-    // 2. Transformer layers
+    // Shared memory for the normalized activation (reused every layer).
     __shared__ half s_norm[HIDDEN_SIZE];
 
+    // ── 2. Transformer layers ────────────────────────────────────────────────
     for (int layer = 0; layer < num_layers; layer++) {
         const LDGLayerWeight &lw = layer_weights[layer];
 
-        // Input RMSNorm (fused residual add inside)
-        device_rmsnorm_step(
-            s_norm,
-            hidden_buffer,
-            reinterpret_cast<half*>(g_residual),
-            reinterpret_cast<const uint2*>(lw.input_layernorm_weight),
-            LDG_RMS_EPS,
-            (int)blockIdx.x
-        );
+        // ── 2a. Input RMSNorm ────────────────────────────────────────────────
+        // hidden_buffer holds the current residual (half).
+        // We normalize it into s_norm (shared), leaving hidden_buffer unchanged.
+        {
+            cg::thread_block blk = cg::this_thread_block();
+            cg::thread_block_tile<32> warp = cg::tiled_partition<32>(blk);
+            __shared__ float s_rms_inv;
+            __shared__ float s_reduce[LDG_BLOCK_SIZE / WARP_SIZE];
+
+            float ss = 0.0f;
+            for (int i = tid; i < HIDDEN_SIZE / 4; i += LDG_BLOCK_SIZE) {
+                uint2 v = reinterpret_cast<const uint2*>(hidden_buffer)[i];
+                reinterpret_cast<uint2*>(s_norm)[i] = v;      // copy to smem
+                half2* h2 = reinterpret_cast<half2*>(&v);
+                float2 a = __half22float2(h2[0]), b = __half22float2(h2[1]);
+                ss += a.x*a.x + a.y*a.y + b.x*b.x + b.y*b.y;
+            }
+            float ws = cg::reduce(warp, ss, cg::plus<float>());
+            if (warp.thread_rank() == 0) s_reduce[tid/32] = ws;
+            blk.sync();
+            float bs = (tid < LDG_BLOCK_SIZE/WARP_SIZE) ? s_reduce[tid] : 0.0f;
+            bs = cg::reduce(warp, bs, cg::plus<float>());
+            if (tid == 0) s_rms_inv = rsqrtf(bs / (float)HIDDEN_SIZE + LDG_RMS_EPS);
+            blk.sync();
+
+            float inv_rms = s_rms_inv;
+            const uint2* wptr = reinterpret_cast<const uint2*>(lw.input_layernorm_weight);
+            for (int i = tid; i < HIDDEN_SIZE/4; i += LDG_BLOCK_SIZE) {
+                uint2 v_val    = reinterpret_cast<uint2*>(s_norm)[i];
+                uint2 v_weight = wptr[i];
+                half2* h2_val = reinterpret_cast<half2*>(&v_val);
+                half2* h2_w   = reinterpret_cast<half2*>(&v_weight);
+                for (int j = 0; j < 2; j++) {
+                    float2 fv = __half22float2(h2_val[j]);
+                    float2 fw = __half22float2(h2_w[j]);
+                    fv.x *= inv_rms * fw.x; fv.y *= inv_rms * fw.y;
+                    h2_val[j] = __float22half2_rn(fv);
+                }
+                reinterpret_cast<uint2*>(s_norm)[i] = v_val;
+            }
+            blk.sync();
+        }
         grid.sync();
 
-        // QKV projection
+        // ── 2b. QKV projection ───────────────────────────────────────────────
         ldg_matvec_qkv_fp16(
             grid, s_norm,
             lw.q_proj_weight, lw.k_proj_weight, lw.v_proj_weight,
@@ -727,35 +766,29 @@ __device__ void ldg_decode_body(
         );
         grid.sync();
 
-        // Q/K norm + RoPE + attention
-        half *layer_k_cache = k_cache + (long long)layer * NUM_KV_HEADS * max_seq_len * HEAD_DIM;
-        half *layer_v_cache = v_cache + (long long)layer * NUM_KV_HEADS * max_seq_len * HEAD_DIM;
-
+        // ── 2c. Attention ────────────────────────────────────────────────────
+        half *lkc = k_cache + (long long)layer * NUM_KV_HEADS * max_seq_len * HEAD_DIM;
+        half *lvc = v_cache + (long long)layer * NUM_KV_HEADS * max_seq_len * HEAD_DIM;
         ldg_attention(
-            grid,
-            g_q, g_k, g_v,
-            layer_k_cache, layer_v_cache,
-            g_attn_out,
-            position + 1,   // cache_len = tokens including current
-            max_seq_len,
-            attn_scale,
-            lw.q_norm_weight,
-            lw.k_norm_weight,
-            cos_table, sin_table,
-            position,
-            lw.o_proj_weight,
-            lw.gate_proj_weight,
-            lw.up_proj_weight,
-            lw.down_proj_weight
+            grid, g_q, g_k, g_v, lkc, lvc, g_attn_out,
+            position + 1, max_seq_len, attn_scale,
+            lw.q_norm_weight, lw.k_norm_weight,
+            cos_table, sin_table, position,
+            lw.o_proj_weight, lw.gate_proj_weight,
+            lw.up_proj_weight, lw.down_proj_weight
         );
-        // grid.sync() already called inside ldg_attention at end
+        // grid.sync() called inside ldg_attention
 
-        // O proj + post-norm + MLP: feed attn_out as float to match signature
-        // Convert half g_attn_out -> float g_activations for the function
+        // ── 2d. Copy hidden_buffer (half) → g_residual (float) for o_proj ───
+        // Convert attn_out (half) → g_activations (float) for o_proj input
+        for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
+            g_residual[i] = __half2float(hidden_buffer[i]);
         for (int i = tid; i < Q_SIZE; i += LDG_BLOCK_SIZE)
             g_activations[i] = __half2float(g_attn_out[i]);
         grid.sync();
 
+        // ── 2e. O-proj + Post-norm + MLP ─────────────────────────────────────
+        // Result written to hidden_buffer (half).
         ldg_o_proj_postnorm_mlp(
             grid,
             lw.o_proj_weight,
@@ -763,33 +796,31 @@ __device__ void ldg_decode_body(
             lw.gate_proj_weight,
             lw.up_proj_weight,
             lw.down_proj_weight,
-            g_activations,
-            g_residual,
-            g_activations,
+            g_activations,   // attn_out (float)
+            g_residual,      // residual (float)
+            g_activations,   // output activations (float, reused)
             g_mlp_intermediate,
-            hidden_buffer
+            hidden_buffer    // final output: MLP out + residual, as half
         );
-        // grid.sync() already called inside ldg_o_proj_postnorm_mlp at end
+        // grid.sync() called inside ldg_o_proj_postnorm_mlp
     }
 
-    // 3. Final RMSNorm -> g_normalized (float, for LM head)
+    // ── 3. Final RMSNorm → g_normalized (float32 for LM head) ───────────────
     {
         __shared__ float s_inv_rms;
-        __shared__ float s_warp_ss[LDG_BLOCK_SIZE / WARP_SIZE];
-        int warp_id = tid / WARP_SIZE;
-        int lane_id = tid % WARP_SIZE;
+        __shared__ float s_wss[LDG_BLOCK_SIZE / WARP_SIZE];
 
-        float local_ss = 0.0f;
+        float ss = 0.0f;
         for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
             float v = __half2float(hidden_buffer[i]);
-            local_ss += v * v;
+            ss += v * v;
         }
-        local_ss = ldg_warp_reduce_sum(local_ss);
-        if (lane_id == 0) s_warp_ss[warp_id] = local_ss;
+        ss = ldg_warp_reduce_sum(ss);
+        if (lane_id == 0) s_wss[warp_id] = ss;
         __syncthreads();
 
         if (warp_id == 0) {
-            float v = (lane_id < LDG_BLOCK_SIZE / WARP_SIZE) ? s_warp_ss[lane_id] : 0.0f;
+            float v = (lane_id < LDG_BLOCK_SIZE/WARP_SIZE) ? s_wss[lane_id] : 0.0f;
             v = ldg_warp_reduce_sum(v);
             if (lane_id == 0) s_inv_rms = rsqrtf(v / (float)HIDDEN_SIZE + LDG_RMS_EPS);
         }
@@ -798,12 +829,12 @@ __device__ void ldg_decode_body(
         float inv_rms = s_inv_rms;
         for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
             float w = __half2float(final_norm_weight[i]);
-            float v = __half2float(hidden_buffer[i]);
-            g_normalized[i] = v * inv_rms * w;
+            g_normalized[i] = __half2float(hidden_buffer[i]) * inv_rms * w;
         }
     }
     grid.sync();
 }
+
 
 __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_direct(
     const half *embed_weight,
