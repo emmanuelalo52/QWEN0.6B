@@ -45,19 +45,19 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
     if verbose:
         print(f"Loading {model_name}...")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16, device_map="cuda"
+        model_name, dtype=torch.float16, device_map="cuda"
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     state = model.state_dict()
 
     # RoPE tables
     inv_freq = 1.0 / (
-        10000.0 ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
+        10000.0 ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float16) / HEAD_DIM)
     )
-    positions = torch.arange(MAX_SEQ_LEN, dtype=torch.float32)
+    positions = torch.arange(MAX_SEQ_LEN, dtype=torch.float16)
     freqs = torch.outer(positions, inv_freq)
-    cos_table = torch.cos(freqs).repeat(1, 2).to(torch.bfloat16).cuda().contiguous()
-    sin_table = torch.sin(freqs).repeat(1, 2).to(torch.bfloat16).cuda().contiguous()
+    cos_table = torch.cos(freqs).repeat(1, 2).to(torch.float16).cuda().contiguous()
+    sin_table = torch.sin(freqs).repeat(1, 2).to(torch.float16).cuda().contiguous()
 
     # Per-layer weight list (11 tensors per layer, flattened)
     layer_weights = []
@@ -142,25 +142,25 @@ class Decoder:
             NUM_KV_HEADS,
             MAX_SEQ_LEN,
             HEAD_DIM,
-            dtype=torch.bfloat16,
+            dtype=torch.float16,
             device="cuda",
         )
         self._v_cache = torch.zeros_like(self._k_cache)
 
         # Scratch buffers (single-token decode)
-        f32 = dict(dtype=torch.float32, device="cuda")
-        bf16 = dict(dtype=torch.bfloat16, device="cuda")
-        self._hidden = torch.empty(HIDDEN_SIZE, **bf16)
-        self._act = torch.empty(HIDDEN_SIZE, **f32)
-        self._res = torch.empty(HIDDEN_SIZE, **f32)
-        self._q = torch.empty(Q_SIZE, **f32)
-        self._k = torch.empty(KV_SIZE, **f32)
-        self._v = torch.empty(KV_SIZE, **f32)
-        self._attn_out = torch.empty(Q_SIZE, **f32)
-        self._mlp_inter = torch.empty(INTERMEDIATE_SIZE, **f32)
-        self._norm_out = torch.empty(HIDDEN_SIZE, **f32)
-        self._bmax_vals = torch.empty(4096, **f32)
-        self._bmax_idxs = torch.empty(4096, dtype=torch.int32, device="cuda")
+        f16 = dict(dtype=torch.float16, device="cuda")
+        fp16 = dict(dtype=torch.float16, device="cuda")
+        self._hidden = torch.empty(HIDDEN_SIZE, **fp16)
+        self._act = torch.empty(HIDDEN_SIZE, **f16)
+        self._res = torch.empty(HIDDEN_SIZE, **f16)
+        self._q = torch.empty(Q_SIZE, **f16)
+        self._k = torch.empty(KV_SIZE, **f16)
+        self._v = torch.empty(KV_SIZE, **f16)
+        self._attn_out = torch.empty(Q_SIZE, **f16)
+        self._mlp_inter = torch.empty(INTERMEDIATE_SIZE, **f16)
+        self._norm_out = torch.empty(HIDDEN_SIZE, **f16)
+        self._Fmax_vals = torch.empty(4096, **f16)
+        self._fmax_idxs = torch.empty(4096, dtype=torch.int32, device="cuda")
         self._out_token = torch.empty(1, dtype=torch.int32, device="cuda")
 
     def step(self, token_id: int) -> int:
@@ -185,8 +185,8 @@ class Decoder:
             self._attn_out,
             self._mlp_inter,
             self._norm_out,
-            self._bmax_vals,
-            self._bmax_idxs,
+            self._Fmax_vals,
+            self._fmax_idxs,
             NUM_LAYERS,
             self._position,
             MAX_SEQ_LEN,
@@ -230,8 +230,8 @@ class Decoder:
             self._attn_out,
             self._mlp_inter,
             self._norm_out,
-            self._bmax_vals,
-            self._bmax_idxs,
+            self._Fmax_vals,
+            self._fmax_idxs,
             NUM_LAYERS,
             self._position,
             MAX_SEQ_LEN,
@@ -245,6 +245,6 @@ class Decoder:
         return self.tokenizer.decode(out, skip_special_tokens=True)
 
 
-def generate(prompt: str, max_tokens: int = 100, verbose: bool = True) -> str:
+def generate(prompt: str, max_tokens: int = 50, verbose: bool = True) -> str:
     """One-shot convenience: load model, generate, return text."""
     return Decoder(verbose=verbose).generate(prompt, max_tokens)

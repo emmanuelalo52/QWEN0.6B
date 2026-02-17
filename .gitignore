@@ -3,3 +3,8 @@
 /cuda_extensions.egg-info
 /dist
 /setup.py
+Tools/megakernel/qwen_ops.cpp:Zone.Identifier
+qwen_megakernel_C.cpython-310-x86_64-linux-gnu.so
+rmsnorm.cpython-310-x86_64-linux-gnu.so
+swiglu_fused.cpython-310-x86_64-linux-gnu.so
+Inference/__pycache__/__init__.cpython-310.pyc
