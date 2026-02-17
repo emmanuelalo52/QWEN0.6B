@@ -21,7 +21,7 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 
 
 #ifndef LDG_NUM_BLOCKS
-#define LDG_NUM_BLOCK 28
+#define LDG_NUM_BLOCKS 28
 #endif
 
 #ifndef LDG_BLOCK_SIZE
@@ -41,7 +41,7 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 #endif
 
 #ifndef LDG_ATTN_BLOCKS
-#define LDG_ATTN_BOCKS NUM_Q_HEADS
+#define LDG_ATTN_BLOCKS NUM_Q_HEADS
 #endif
 
 #ifndef LDG_PREFETCH_QK
@@ -78,15 +78,17 @@ constexpr float LDG_RMS_EPS = 1e-6f;
 constexpr int LDG_VOCAB_SIZE = 151936;
 
 struct LDGLayerWeight{
-    const uint2* input_layernorm_weight;
-    const uint2* q_proj_weight;
-    const uint2* k_proj_weight;
-    const uint2* v_proj_weight;
-    const uint2* k_norm_weight;
-    const uint2* o_proj_weight;
-    const uint2* post_attn_layernorm_weight;
-    const uint2* gate_proj_weight;
-    const uint2* down_proj_weight;
+    const half* input_layernorm_weight;      // [HIDDEN_SIZE]
+    const half* q_proj_weight;               // [Q_SIZE, HIDDEN_SIZE]
+    const half* k_proj_weight;               // [KV_SIZE, HIDDEN_SIZE]
+    const half* v_proj_weight;               // [KV_SIZE, HIDDEN_SIZE]
+    const half* q_norm_weight;               // [HEAD_DIM]  <-- was missing
+    const half* k_norm_weight;               // [HEAD_DIM]
+    const half* o_proj_weight;               // [HIDDEN_SIZE, Q_SIZE]
+    const half* post_attn_layernorm_weight;  // [HIDDEN_SIZE]
+    const half* gate_proj_weight;            // [INTERMEDIATE_SIZE, HIDDEN_SIZE]
+    const half* up_proj_weight;              // [INTERMEDIATE_SIZE, HIDDEN_SIZE]  <-- was missing
+    const half* down_proj_weight;            // [HIDDEN_SIZE, INTERMEDIATE_SIZE]
 };
 
 
@@ -363,8 +365,8 @@ __device__ void ldg_attention(
     }
 
     // Attention blocks: Handle Q norm + RoPE
-    if(block_id < LDG_ATTN_BOCKS && warp_id == 0){
-        int heads_per_block = (NUM_Q_HEADS + LDG_ATTN_BOCKS - 1) / LDG_ATTN_BOCKS;
+    if(block_id < LDG_ATTN_BLOCKS && warp_id == 0){
+        int heads_per_block = (NUM_Q_HEADS + LDG_ATTN_BLOCKS - 1) / LDG_ATTN_BLOCKS;
         int q_start = block_id * heads_per_block;
         int q_end = min(q_start + heads_per_block, NUM_Q_HEADS);
 
@@ -391,9 +393,9 @@ __device__ void ldg_attention(
     }
 
     // --- 2. Prefetching (Idle Blocks) ---
-    if (block_id >= LDG_ATTN_BOCKS) {
-        int prefetch_id = block_id - LDG_ATTN_BOCKS;
-        int num_prefetch_blocks = LDG_NUM_BLOCK - LDG_ATTN_BOCKS;
+    if (block_id >= LDG_ATTN_BLOCKS) {
+        int prefetch_id = block_id - LDG_ATTN_BLOCKS;
+        int num_prefetch_blocks = LDG_NUM_BLOCKS - LDG_ATTN_BLOCKS;
         // Divide weights across remaining blocks to warm L2 cache
         int total_elements = (HIDDEN_SIZE * Q_SIZE) + (HIDDEN_SIZE * INTERMEDIATE_SIZE * 3); 
         int per_block = (total_elements + num_prefetch_blocks - 1) / num_prefetch_blocks;
@@ -414,8 +416,8 @@ __device__ void ldg_attention(
     __shared__ float s_sum_exp[LDG_NUM_WARPS];
     __shared__ float s_out_acc[LDG_NUM_WARPS][HEAD_DIM];
 
-    if(block_id < LDG_ATTN_BOCKS){
-        int heads_per_block = (NUM_Q_HEADS + LDG_ATTN_BOCKS - 1) / LDG_ATTN_BOCKS;
+    if(block_id < LDG_ATTN_BLOCKS){
+        int heads_per_block = (NUM_Q_HEADS + LDG_ATTN_BLOCKS - 1) / LDG_ATTN_BLOCKS;
         int q_start = block_id * heads_per_block;
         int q_end = min(q_start + heads_per_block, NUM_Q_HEADS);
 
@@ -679,7 +681,8 @@ __global__ void ldg_update_step(
 static inline void ldg_configure_kernel_attributes();
 
 // Decoder kernels (must be defined in your main file)
-__global__ void ldg_decode_kernel_direct(
+// Shared decode body called by both direct and persistent kernels
+__device__ void ldg_decode_body(
     const half *embed_weight,
     const LDGLayerWeight *layer_weights,
     const half *final_norm_weight,
@@ -688,34 +691,161 @@ __global__ void ldg_decode_kernel_direct(
     half *k_cache, half *v_cache,
     half *hidden_buffer,
     float *g_activations, float *g_residual,
-    float *g_q, float *g_k, float *g_v,
-    float *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
+    half *g_q, half *g_k, half *g_v,
+    half *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
+    int num_layers, int position, int input_token_id,
+    int max_seq_len, float attn_scale,
+    AtomicGridSync &grid)
+{
+    int tid = threadIdx.x;
+
+    // 1. Embedding lookup -- block 0 writes residual, all blocks read it after sync
+    if (blockIdx.x == 0) {
+        const half *embed_row = embed_weight + (long long)input_token_id * HIDDEN_SIZE;
+        for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+            hidden_buffer[i] = embed_row[i];
+            g_residual[i]    = __half2float(embed_row[i]);
+        }
+    }
+    grid.sync();
+
+    // 2. Transformer layers
+    __shared__ half s_norm[HIDDEN_SIZE];
+
+    for (int layer = 0; layer < num_layers; layer++) {
+        const LDGLayerWeight &lw = layer_weights[layer];
+
+        // Input RMSNorm (fused residual add inside)
+        device_rmsnorm_step(
+            s_norm,
+            hidden_buffer,
+            reinterpret_cast<half*>(g_residual),
+            reinterpret_cast<const uint2*>(lw.input_layernorm_weight),
+            LDG_RMS_EPS,
+            (int)blockIdx.x
+        );
+        grid.sync();
+
+        // QKV projection
+        ldg_matvec_qkv_fp16(
+            grid, s_norm,
+            lw.q_proj_weight, lw.k_proj_weight, lw.v_proj_weight,
+            g_q, g_k, g_v
+        );
+        grid.sync();
+
+        // Q/K norm + RoPE + attention
+        half *layer_k_cache = k_cache + (long long)layer * NUM_KV_HEADS * max_seq_len * HEAD_DIM;
+        half *layer_v_cache = v_cache + (long long)layer * NUM_KV_HEADS * max_seq_len * HEAD_DIM;
+
+        ldg_attention(
+            grid,
+            g_q, g_k, g_v,
+            layer_k_cache, layer_v_cache,
+            g_attn_out,
+            position + 1,   // cache_len = tokens including current
+            max_seq_len,
+            attn_scale,
+            lw.q_norm_weight,
+            lw.k_norm_weight,
+            cos_table, sin_table,
+            position,
+            lw.o_proj_weight,
+            lw.gate_proj_weight,
+            lw.up_proj_weight,
+            lw.down_proj_weight
+        );
+        // grid.sync() already called inside ldg_attention at end
+
+        // O proj + post-norm + MLP: feed attn_out as float to match signature
+        // Convert half g_attn_out -> float g_activations for the function
+        for (int i = tid; i < Q_SIZE; i += LDG_BLOCK_SIZE)
+            g_activations[i] = __half2float(g_attn_out[i]);
+        grid.sync();
+
+        ldg_o_proj_postnorm_mlp(
+            grid,
+            lw.o_proj_weight,
+            lw.post_attn_layernorm_weight,
+            lw.gate_proj_weight,
+            lw.up_proj_weight,
+            lw.down_proj_weight,
+            g_activations,
+            g_residual,
+            g_activations,
+            g_mlp_intermediate,
+            hidden_buffer
+        );
+        // grid.sync() already called inside ldg_o_proj_postnorm_mlp at end
+    }
+
+    // 3. Final RMSNorm -> g_normalized (float, for LM head)
+    {
+        __shared__ float s_inv_rms;
+        __shared__ float s_warp_ss[LDG_BLOCK_SIZE / WARP_SIZE];
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+
+        float local_ss = 0.0f;
+        for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+            float v = __half2float(hidden_buffer[i]);
+            local_ss += v * v;
+        }
+        local_ss = ldg_warp_reduce_sum(local_ss);
+        if (lane_id == 0) s_warp_ss[warp_id] = local_ss;
+        __syncthreads();
+
+        if (warp_id == 0) {
+            float v = (lane_id < LDG_BLOCK_SIZE / WARP_SIZE) ? s_warp_ss[lane_id] : 0.0f;
+            v = ldg_warp_reduce_sum(v);
+            if (lane_id == 0) s_inv_rms = rsqrtf(v / (float)HIDDEN_SIZE + LDG_RMS_EPS);
+        }
+        __syncthreads();
+
+        float inv_rms = s_inv_rms;
+        for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+            float w = __half2float(final_norm_weight[i]);
+            float v = __half2float(hidden_buffer[i]);
+            g_normalized[i] = v * inv_rms * w;
+        }
+    }
+    grid.sync();
+}
+
+__global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_direct(
+    const half *embed_weight,
+    const LDGLayerWeight *layer_weights,
+    const half *final_norm_weight,
+    const half *cos_table,
+    const half *sin_table,
+    half *k_cache, half *v_cache,
+    half *hidden_buffer,
+    float *g_activations, float *g_residual,
+    half *g_q, half *g_k, half *g_v,
+    half *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
     unsigned int *barrier_counter, unsigned int *barrier_sense,
     unsigned int *kv_flag, unsigned int *attn_flag,
     int num_layers, int position, int input_token_id,
     int max_seq_len, float attn_scale)
 {
-    // Minimal, safe fallback implementation for GTX 1650 fp16:
-    // Fill the normalized activation vector with zeros to allow LM head to run.
-    // Only block 0 will perform the write to avoid races between blocks.
-    if (blockIdx.x == 0) {
-        int tid = threadIdx.x;
-        int stride = blockDim.x;
-        for (int i = tid; i < HIDDEN_SIZE; i += stride) {
-            g_normalized[i] = 0.0f;
-        }
-    }
-    // Optionally initialize other buffers for safety (only by thread 0)
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        if (g_activations) {
-            for (int i = 0; i < HIDDEN_SIZE; ++i) g_activations[i] = 0.0f;
-        }
-    }
-    // Make sure writes complete before returning
-    __syncthreads();
+    AtomicGridSync grid;
+    grid.counter    = barrier_counter;
+    grid.generation = barrier_sense;
+    grid.nblocks    = gridDim.x;
+    grid.local_gen  = 0;
+
+    ldg_decode_body(
+        embed_weight, layer_weights, final_norm_weight,
+        cos_table, sin_table,
+        k_cache, v_cache, hidden_buffer,
+        g_activations, g_residual,
+        g_q, g_k, g_v, g_attn_out, g_mlp_intermediate, g_normalized,
+        num_layers, position, input_token_id, max_seq_len, attn_scale,
+        grid
+    );
 }
 
-__global__ void ldg_decode_kernel_persistent(
+__global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_persistent(
     const half *embed_weight,
     const LDGLayerWeight *layer_weights,
     const half *final_norm_weight,
@@ -724,27 +854,28 @@ __global__ void ldg_decode_kernel_persistent(
     half *k_cache, half *v_cache,
     half *hidden_buffer,
     float *g_activations, float *g_residual,
-    float *g_q, float *g_k, float *g_v,
-    float *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
+    half *g_q, half *g_k, half *g_v,
+    half *g_attn_out, float *g_mlp_intermediate, float *g_normalized,
     unsigned int *barrier_counter, unsigned int *barrier_sense,
     unsigned int *kv_flag, unsigned int *attn_flag,
     int num_layers, const int *d_position,
     const int *d_token_id, int max_seq_len, float attn_scale)
 {
-    // Minimal persistent-style fallback: same behaviour as direct.
-    if (blockIdx.x == 0) {
-        int tid = threadIdx.x;
-        int stride = blockDim.x;
-        for (int i = tid; i < HIDDEN_SIZE; i += stride) {
-            g_normalized[i] = 0.0f;
-        }
-    }
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        if (g_activations) {
-            for (int i = 0; i < HIDDEN_SIZE; ++i) g_activations[i] = 0.0f;
-        }
-    }
-    __syncthreads();
+    AtomicGridSync grid;
+    grid.counter    = barrier_counter;
+    grid.generation = barrier_sense;
+    grid.nblocks    = gridDim.x;
+    grid.local_gen  = 0;
+
+    ldg_decode_body(
+        embed_weight, layer_weights, final_norm_weight,
+        cos_table, sin_table,
+        k_cache, v_cache, hidden_buffer,
+        g_activations, g_residual,
+        g_q, g_k, g_v, g_attn_out, g_mlp_intermediate, g_normalized,
+        num_layers, *d_position, *d_token_id, max_seq_len, attn_scale,
+        grid
+    );
 }
 /**
  * Phase 1: Distributed vocab projection and block-level argmax
@@ -918,14 +1049,14 @@ extern "C" void launch_ldg_decode_direct(
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
 
-  ldg_decode_kernel_direct<<<LDG_NUM_BLOCK, LDG_BLOCK_SIZE, 0, stream>>>(
+  ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
       (const half *)embed_weight, layer_weights,
       (const half *)final_norm_weight,
       (const half *)cos_table, (const half *)sin_table,
       (half *)k_cache, (half *)v_cache,
       (half *)hidden_buffer, (float *)g_activations,
-      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
-      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      (float *)g_residual, (half *)g_q, (half *)g_k, (half *)g_v,
+      (half *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
       d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
       position, input_token_id, max_seq_len, attn_scale);
 
@@ -962,14 +1093,14 @@ extern "C" void launch_ldg_decode_persistent(
   cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
                   cudaMemcpyHostToDevice, stream);
 
-  ldg_decode_kernel_persistent<<<LDG_NUM_BLOCK, LDG_BLOCK_SIZE, 0, stream>>>(
+  ldg_decode_kernel_persistent<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
       (const half *)embed_weight, layer_weights,
       (const half *)final_norm_weight,
       (const half *)cos_table, (const half *)sin_table,
       (half *)k_cache, (half *)v_cache,
       (half *)hidden_buffer, (float *)g_activations,
-      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
-      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      (float *)g_residual, (half *)g_q, (half *)g_k, (half *)g_v,
+      (half *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
       d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
       d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
 
@@ -1016,14 +1147,14 @@ extern "C" void launch_ldg_generate_nosync(
                   cudaMemcpyHostToDevice, stream);
 
   for (int step = 0; step < num_steps; step++) {
-    ldg_decode_kernel_persistent<<<LDG_NUM_BLOCK, LDG_BLOCK_SIZE, 0, stream>>>(
+    ldg_decode_kernel_persistent<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
         (const half *)embed_weight, layer_weights,
         (const half *)final_norm_weight,
         (const half *)cos_table, (const half *)sin_table,
         (half *)k_cache, (half *)v_cache,
         (half *)hidden_buffer, (float *)g_activations,
-        (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
-        (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+        (float *)g_residual, (half *)g_q, (half *)g_k, (half *)g_v,
+        (half *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
         d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
         d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
 
