@@ -174,17 +174,19 @@ class Decoder:
 
         # Scratch buffers
         f16 = dict(dtype=torch.float16, device="cuda")
+        f32 = dict(dtype=torch.float32, device="cuda")
         i32 = dict(dtype=torch.int32,   device="cuda")
         self._hidden    = torch.empty(HIDDEN_SIZE,        **f16)
-        self._act       = torch.empty(HIDDEN_SIZE,        **f16)
-        self._res       = torch.empty(HIDDEN_SIZE,        **f16)
+        # These buffers are consumed as float* inside the CUDA megakernel.
+        self._act       = torch.empty(HIDDEN_SIZE,        **f32)
+        self._res       = torch.empty(HIDDEN_SIZE,        **f32)
         self._q         = torch.empty(Q_SIZE,             **f16)
         self._k         = torch.empty(KV_SIZE,            **f16)
         self._v         = torch.empty(KV_SIZE,            **f16)
         self._attn_out  = torch.empty(Q_SIZE,             **f16)
-        self._mlp_inter = torch.empty(INTERMEDIATE_SIZE,  **f16)
-        self._norm_out  = torch.empty(HIDDEN_SIZE,        **f16)
-        self._fmax_vals = torch.empty(4096,               **f16)
+        self._mlp_inter = torch.empty(INTERMEDIATE_SIZE,  **f32)
+        self._norm_out  = torch.empty(HIDDEN_SIZE,        **f32)
+        self._fmax_vals = torch.empty(4096,               **f32)
         self._fmax_idxs = torch.empty(4096,               **i32)
         self._out_token = torch.empty(1,                  **i32)
 
