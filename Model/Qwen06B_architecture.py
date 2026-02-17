@@ -1,8 +1,6 @@
 """Weight loading and high-level decode API for Qwen3-0.6B."""
 
 import math
-import struct
-
 import torch
 
 try:
@@ -130,14 +128,16 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
 
 def _pack_layer_weights(layer_weights: list[torch.Tensor]) -> torch.Tensor:
     """Pack 11-tensor-per-layer flat list into a device blob of LDGLayerWeights structs."""
-    ptr_size = 8  # 64-bit pointers
     n_ptrs = 11
-    buf = bytearray(NUM_LAYERS * n_ptrs * ptr_size)
+    ptrs: list[int] = []
     for i in range(NUM_LAYERS):
         for j in range(n_ptrs):
-            ptr = layer_weights[i * n_ptrs + j].data_ptr()
-            struct.pack_into("Q", buf, (i * n_ptrs + j) * ptr_size, ptr)
-    return torch.frombuffer(buf, dtype=torch.uint8).cuda()
+            ptrs.append(layer_weights[i * n_ptrs + j].data_ptr())
+
+    # Keep pointers as int64 so the backing storage is naturally 8-byte aligned.
+    # The CUDA kernel reinterprets this memory as an array of LDGLayerWeight structs
+    # (11 pointer fields per layer), so preserving packed 64-bit layout is critical.
+    return torch.tensor(ptrs, dtype=torch.int64, device="cuda").contiguous()
 
 
 class Decoder:
