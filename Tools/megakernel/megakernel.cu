@@ -130,21 +130,13 @@ __device__ __forceinline__ float ldg_warp_reduce_sum(float val){
 #define LOG2E_HALF __float2half(1.44269504088896340736f)
 
 __device__ __forceinline__ __half ptx_hrcp(__half x) {
-    __half y;
-    unsigned short xbits = __half_as_ushort(x);
-    unsigned short ybits;
-    asm volatile("rcp.approx.ftz.f16 %0, %1;" : "=h"(ybits) : "h"(xbits));
-    y = __ushort_as_half(ybits);
-    return y;
+    // CUDA 13's PTXAS rejects the older inline PTX variants used here.
+    // Use portable intrinsics instead so the extension builds across toolkits.
+    return __float2half(1.0f / __half2float(x));
 }
 
 __device__ __forceinline__ __half ptx_hexp2(__half x) {
-    __half y;
-    unsigned short xbits = __half_as_ushort(x);
-    unsigned short ybits;
-    asm volatile("ex2.approx.ftz.f16 %0, %1;" : "=h"(ybits) : "h"(xbits));
-    y = __ushort_as_half(ybits);
-    return y;
+    return __float2half(exp2f(__half2float(x)));
 }
 
 __device__ __forceinline__ __half fast_exp(__half x) {
