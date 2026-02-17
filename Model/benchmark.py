@@ -56,7 +56,7 @@ def bench_pytorch_hf():
 
 
 def bench_megakernel():
-    from Model.Qwen06B_architecture import Decoder
+    from Qwen06B_architecture import Decoder
 
     dec = Decoder(verbose=False)
 
@@ -101,7 +101,7 @@ def correctness_check():
     )
     model.eval()
 
-    from Model.Qwen06B_architecture import Decoder
+    from Qwen06B_architecture import Decoder
 
     dec = Decoder(weights=None, tokenizer=tokenizer, verbose=False)
 

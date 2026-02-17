@@ -5,6 +5,12 @@ import struct
 
 import torch
 
+if torch.__version__ != "expected_version":
+    print("Skipping import of cpp extensions due to incompatible torch version")
+    qwen_megakernel_C = None
+else:
+    import qwen_megakernel_C
+
 NUM_LAYERS = 28
 NUM_KV_HEADS = 8
 HEAD_DIM = 128

@@ -8,3 +8,4 @@ qwen_megakernel_C.cpython-310-x86_64-linux-gnu.so
 rmsnorm.cpython-310-x86_64-linux-gnu.so
 swiglu_fused.cpython-310-x86_64-linux-gnu.so
 Inference/__pycache__/__init__.cpython-310.pyc
+Model/__pycache__/Qwen06B_architecture.cpython-310.pyc
