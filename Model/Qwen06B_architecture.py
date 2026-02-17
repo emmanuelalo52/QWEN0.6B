@@ -8,6 +8,8 @@ try:
 except ImportError:
     qwen_megakernel_C = None
 
+EXTENSION_ABI_VERSION = 2
+
 NUM_LAYERS = 28
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
@@ -50,6 +52,37 @@ def _require_megakernel_op(op_name: str):
     )
 
 
+def _assert_extension_compatibility() -> None:
+    """Fail fast on stale extension builds that can crash with CUDA misalignment."""
+    if qwen_megakernel_C is None:
+        return
+
+    ext_abi = None
+    if hasattr(qwen_megakernel_C, "abi_version"):
+        try:
+            ext_abi = int(qwen_megakernel_C.abi_version())
+        except Exception:
+            ext_abi = None
+
+    if ext_abi != EXTENSION_ABI_VERSION:
+        built_torch = "unknown"
+        if hasattr(qwen_megakernel_C, "built_torch_version"):
+            try:
+                built_torch = str(qwen_megakernel_C.built_torch_version())
+            except Exception:
+                built_torch = "unknown"
+
+        raise RuntimeError(
+            "Incompatible qwen_megakernel_C extension binary detected. "
+            f"Expected ABI {EXTENSION_ABI_VERSION}, got {ext_abi}. "
+            "This usually means Python code and CUDA extension are out-of-sync "
+            "(e.g. pointer packing changed) and can trigger CUDA 'misaligned address'. "
+            f"Rebuild/reinstall qwen_megakernel_C for torch {torch.__version__} "
+            f"(extension was built against {built_torch})."
+        )
+
+
+_assert_extension_compatibility()
 _decode = _require_megakernel_op("decode")
 
 
