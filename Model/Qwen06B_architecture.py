@@ -21,7 +21,22 @@ KV_SIZE = 8 * HEAD_DIM  # 1024
 MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
-_decode = torch.ops.qwen_megakernel_C.decode
+
+def _require_megakernel_op(op_name: str):
+    """Return an op from torch.ops.qwen_megakernel_C or raise a clear error."""
+    namespace = getattr(torch.ops, "qwen_megakernel_C", None)
+    if namespace is None or not hasattr(namespace, op_name):
+        raise RuntimeError(
+            "qwen_megakernel_C op '"
+            f"{op_name}"
+            "' is unavailable. The C++/CUDA extension is not loaded for this "
+            "PyTorch build. Rebuild/install the megakernel extension against your "
+            f"current torch version ({torch.__version__})."
+        )
+    return getattr(namespace, op_name)
+
+
+_decode = _require_megakernel_op("decode")
 
 
 def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
@@ -215,7 +230,7 @@ class Decoder:
         ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         for tid in ids[:-1]:
             self.step(tid)
-        _gen = torch.ops.qwen_megakernel_C.generate_nosync
+        _gen = _require_megakernel_op("generate_nosync")
         output_ids = _gen(
             ids[-1],
             max_tokens,

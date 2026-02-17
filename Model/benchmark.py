@@ -16,6 +16,16 @@ CHECK_TOKENS = 8
 RUN_CORRECTNESS = True
 
 
+def megakernel_available() -> tuple[bool, str]:
+    namespace = getattr(torch.ops, "qwen_megakernel_C", None)
+    if namespace is None:
+        return False, "torch.ops.qwen_megakernel_C namespace is missing"
+    missing = [op for op in ("decode", "generate_nosync") if not hasattr(namespace, op)]
+    if missing:
+        return False, f"missing ops: {', '.join(missing)}"
+    return True, "ok"
+
+
 def bench_pytorch_hf():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -140,13 +150,18 @@ if __name__ == "__main__":
     print()
 
     print("Megakernel")
-    if RUN_CORRECTNESS:
-        correctness_check()
-        print()
-    mk_tok, mk_ms = bench_megakernel()
+    available, reason = megakernel_available()
+    if not available:
+        print(f"Megakernel extension unavailable: {reason}")
+        print("Rebuild/install qwen_megakernel_C for this torch version and rerun.")
+    else:
+        if RUN_CORRECTNESS:
+            correctness_check()
+            print()
+        mk_tok, mk_ms = bench_megakernel()
 
-    print()
-    print("=" * 55)
-    print(f"{'Backend':<25} {'tok/s':>8} {'ms/tok':>8}")
-    print("-" * 55)
-    print(f"{'Megakernel':<25} {mk_tok:>8.1f} {mk_ms:>8.2f}")
+        print()
+        print("=" * 55)
+        print(f"{'Backend':<25} {'tok/s':>8} {'ms/tok':>8}")
+        print("-" * 55)
+        print(f"{'Megakernel':<25} {mk_tok:>8.1f} {mk_ms:>8.2f}")
