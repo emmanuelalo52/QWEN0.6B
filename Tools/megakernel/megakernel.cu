@@ -89,6 +89,7 @@ struct LDGLayerWeight{
     const half* gate_proj_weight;            // [INTERMEDIATE_SIZE, HIDDEN_SIZE]
     const half* up_proj_weight;              // [INTERMEDIATE_SIZE, HIDDEN_SIZE]  <-- was missing
     const half* down_proj_weight;            // [HIDDEN_SIZE, INTERMEDIATE_SIZE]
+    const void* padding;
 };
 
 
