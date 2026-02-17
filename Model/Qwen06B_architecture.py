@@ -5,11 +5,6 @@ import struct
 
 import torch
 
-if torch.__version__ != "expected_version":
-    print("Skipping import of cpp extensions due to incompatible torch version")
-    qwen_megakernel_C = None
-else:
-    import qwen_megakernel_C
 
 NUM_LAYERS = 28
 NUM_KV_HEADS = 8
@@ -36,7 +31,8 @@ def _require_megakernel_op(op_name: str):
     return getattr(namespace, op_name)
 
 
-_decode = _require_megakernel_op("decode")
+import qwen_megakernel_C
+_decode = qwen_megakernel_C.decode
 
 
 def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):

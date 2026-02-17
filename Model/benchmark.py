@@ -17,13 +17,14 @@ RUN_CORRECTNESS = True
 
 
 def megakernel_available() -> tuple[bool, str]:
-    namespace = getattr(torch.ops, "qwen_megakernel_C", None)
-    if namespace is None:
-        return False, "torch.ops.qwen_megakernel_C namespace is missing"
-    missing = [op for op in ("decode", "generate_nosync") if not hasattr(namespace, op)]
-    if missing:
-        return False, f"missing ops: {', '.join(missing)}"
-    return True, "ok"
+    try:
+        import qwen_megakernel_C
+        missing = [op for op in ("decode", "generate_nosync") if not hasattr(qwen_megakernel_C, op)]
+        if missing:
+            return False, f"missing ops: {', '.join(missing)}"
+        return True, "ok"
+    except ImportError as e:
+        return False, str(e)
 
 
 def bench_pytorch_hf():
