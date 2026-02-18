@@ -224,9 +224,8 @@ class Decoder:
         i32 = dict(dtype=torch.int32,   device="cuda")
         self._hidden    = torch.empty(HIDDEN_SIZE,        **f16)
         # act/mlp_inter/norm_out are float32 (used as float* in kernel)
-        self._act       = torch.empty(HIDDEN_SIZE,        **f32)
-        # res is half - device_rmsnorm_step casts it to half* internally
-        self._res       = torch.empty(HIDDEN_SIZE,        **f16)
+        self._act    = torch.empty(Q_SIZE,            **f32)  # 2048 floats - o_proj input
+        self._res    = torch.empty(HIDDEN_SIZE,       **f32)  # 1024 floats - residual (float32 not float16!)
         self._q         = torch.empty(Q_SIZE,             **f16)
         self._k         = torch.empty(KV_SIZE,            **f16)
         self._v         = torch.empty(KV_SIZE,            **f16)

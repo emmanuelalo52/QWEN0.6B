@@ -568,7 +568,7 @@ __device__ void ldg_o_proj_postnorm_mlp(
             float v = g_activations[i];
             s_act[i] = __float2half(v); 
             local_ss += v * v;
-            if (block_id == 0) g_residual[i] = v; // Save residual for next layer
+            // if (block_id == 0) g_residual[i] = v; // Save residual for next layer
         }
         local_ss = ldg_warp_reduce_sum(local_ss);
         if (lane_id == 0) atomicAdd(&s_sum_sq, local_ss);
@@ -648,7 +648,7 @@ __device__ void ldg_o_proj_postnorm_mlp(
         }
         sum = ldg_warp_reduce_sum(sum);
         if (lane_id == 0) {
-            hidden_out[m] = __float2half(sum + g_residual[m]);
+            hidden_out[m] = __float2half(sum + g_activations[m]);
         }
     }
     grid.sync();
@@ -751,11 +751,14 @@ __device__ void ldg_decode_body(
             __shared__ __align__(16) float s_reduce[LDG_BLOCK_SIZE / WARP_SIZE];
 
             float ss = 0.0f;
+            // Read 4 halfs (uint2=8 bytes) from hidden_buffer, write as 2x half2 to s_norm
             for (int i = tid; i < HIDDEN_SIZE / 4; i += LDG_BLOCK_SIZE) {
                 uint2 v = reinterpret_cast<const uint2*>(hidden_buffer)[i];
-                reinterpret_cast<uint2*>(s_norm)[i] = v;      // copy to smem
-                half2* h2 = reinterpret_cast<half2*>(&v);
-                float2 a = __half22float2(h2[0]), b = __half22float2(h2[1]);
+                half2* h2_src = reinterpret_cast<half2*>(&v);
+                // Write as half2 (4 bytes) instead of uint2 (8 bytes) to avoid alignment issues
+                reinterpret_cast<half2*>(s_norm)[i*2]   = h2_src[0];
+                reinterpret_cast<half2*>(s_norm)[i*2+1] = h2_src[1];
+                float2 a = __half22float2(h2_src[0]), b = __half22float2(h2_src[1]);
                 ss += a.x*a.x + a.y*a.y + b.x*b.x + b.y*b.y;
             }
             float ws = cg::reduce(warp, ss, cg::plus<float>());
@@ -769,17 +772,18 @@ __device__ void ldg_decode_body(
             float inv_rms = s_rms_inv;
             const uint2* wptr = reinterpret_cast<const uint2*>(lw.input_layernorm_weight);
             for (int i = tid; i < HIDDEN_SIZE/4; i += LDG_BLOCK_SIZE) {
-                uint2 v_val    = reinterpret_cast<uint2*>(s_norm)[i];
+                // Read 4 halfs from s_norm as 2x half2, apply weight, write back as 2x half2
+                half2* s_norm_h2 = reinterpret_cast<half2*>(s_norm);
                 uint2 v_weight = wptr[i];
-                half2* h2_val = reinterpret_cast<half2*>(&v_val);
-                half2* h2_w   = reinterpret_cast<half2*>(&v_weight);
+                half2* h2_w = reinterpret_cast<half2*>(&v_weight);
+                
                 for (int j = 0; j < 2; j++) {
-                    float2 fv = __half22float2(h2_val[j]);
+                    int idx = i*2 + j;
+                    float2 fv = __half22float2(s_norm_h2[idx]);
                     float2 fw = __half22float2(h2_w[j]);
                     fv.x *= inv_rms * fw.x; fv.y *= inv_rms * fw.y;
-                    h2_val[j] = __float22half2_rn(fv);
+                    s_norm_h2[idx] = __float22half2_rn(fv);
                 }
-                reinterpret_cast<uint2*>(s_norm)[i] = v_val;
             }
             blk.sync();
         }
