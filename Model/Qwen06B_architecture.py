@@ -161,26 +161,28 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
 
 
 def _pack_layer_weights(layer_weights: list) -> torch.Tensor:
-    """
-    Pack flat list of (NUM_LAYERS * 11) tensors into GPU LDGLayerWeight structs.
-    C struct: 11 half* + 1 void* padding = 12 x int64 = 96 bytes/layer.
-    layer_weights is FLAT: [layer0_w0..w10, layer1_w0..w10, ..., layer27_w0..w10]
-    """
     N = 11
     n_layers = len(layer_weights) // N
-    assert len(layer_weights) == n_layers * N, (
-        f"layer_weights length {len(layer_weights)} not divisible by {N}"
-    )
+    assert len(layer_weights) == n_layers * N
     all_ptrs = []
     for li in range(n_layers):
         base = li * N
         for j in range(N):
             all_ptrs.append(layer_weights[base + j].data_ptr())
-        all_ptrs.append(0)  # 12th padding slot
-    t = torch.tensor(all_ptrs, dtype=torch.int64, device="cuda")
-    if t.data_ptr() % 16 != 0:
-        t = torch.tensor([0] + all_ptrs, dtype=torch.int64, device="cuda")[1:]
-    return t
+        all_ptrs.append(0)  # padding slot
+
+    # Allocate with explicit 16-byte alignment guarantee
+    # Allocate extra 1 element, then slice to align base to 16 bytes
+    t = torch.zeros(len(all_ptrs) + 1, dtype=torch.int64, device="cuda")
+    # Find the first index where data_ptr is 16-byte aligned
+    base_ptr = t.data_ptr()
+    offset = (16 - (base_ptr % 16)) % 16  # bytes to skip
+    offset_elems = offset // 8  # int64 elements to skip
+    t_aligned = t[offset_elems : offset_elems + len(all_ptrs)]
+    t_aligned.copy_(torch.tensor(all_ptrs, dtype=torch.int64))
+    assert t_aligned.data_ptr() % 16 == 0, "Alignment failed!"
+    return t_aligned
+
 
 class Decoder:
     """Stateful decoder wrapping the Qwen megakernel ops."""
@@ -205,6 +207,8 @@ class Decoder:
         self._cos_table           = weights["cos_table"]
         self._sin_table           = weights["sin_table"]
         self._layer_weights_packed = _pack_layer_weights(weights["layer_weights"])
+        self._check_weight_alignment(weights["layer_weights"])
+        self._attn_scale = 1.0 / math.sqrt(HEAD_DIM)
         self._attn_scale          = 1.0 / math.sqrt(HEAD_DIM)
 
         # KV cache
@@ -232,47 +236,82 @@ class Decoder:
         self._fmax_vals = torch.empty(4096,               **f32)
         self._fmax_idxs = torch.empty(4096,               **i32)
         self._out_token = torch.empty(1,                  **i32)
+        
+    def _check_weight_alignment(self, layer_weights_list):
+        N = 11
+        names = [
+            "input_layernorm", "q_proj", "k_proj", "v_proj",
+            "q_norm", "k_norm", "o_proj", "post_attn_norm",
+            "gate_proj", "up_proj", "down_proj"
+        ]
+        bad = []
+        for li in range(NUM_LAYERS):
+            for j in range(N):
+                ptr = layer_weights_list[li * N + j].data_ptr()
+                if ptr % 16 != 0:
+                    bad.append(f"  Layer {li} [{names[j]}]: ptr={ptr:#x}, rem={ptr%16}")
+        if bad:
+            print("MISALIGNED WEIGHT TENSORS:")
+            for b in bad:
+                print(b)
+        else:
+            print("All weight pointers 16-byte aligned OK")
+        
+        
 
     def step(self, input_token_id: int | torch.Tensor) -> int:
-        # ... (keep existing conversion code)
-        
-        try:
-            # REMOVE self._out_token from the arguments
-            # CAPTURE the return value in a variable
-            result_tensor = _decode(
-                input_token_id,               # arg0: input_token_id
-                self._embed_weight,    # arg1: embed_weight (Corrected position)
-                self._layer_weights_packed,
-                self._final_norm_weight,
-                self._lm_head_weight,
-                self._cos_table,
-                self._sin_table,
-                self._k_cache,
-                self._v_cache,
-                self._hidden,
-                self._act,
-                self._res,
-                self._q,
-                self._k,
-                self._v,
-                self._attn_out,
-                self._mlp_inter,
-                self._norm_out,
-                self._fmax_vals,
-                self._fmax_idxs,
-                NUM_LAYERS,
-                self._position,
-                MAX_SEQ_LEN,
-                self._attn_scale,
-            )
-            torch.cuda.synchronize()
-            
-            # Update the internal buffer if you still need it
-            self._out_token.copy_(result_tensor)
-            
-        except RuntimeError as e:
-            raise e
+        buffers = {
+        "hidden":    self._hidden,
+        "act":       self._act,
+        "res":       self._res,
+        "q":         self._q,
+        "k":         self._k,
+        "v":         self._v,
+        "attn_out":  self._attn_out,
+        "mlp_inter": self._mlp_inter,
+        "norm_out":  self._norm_out,
+        "fmax_vals": self._fmax_vals,
+        "fmax_idxs": self._fmax_idxs,
+        "k_cache":   self._k_cache,
+        "v_cache":   self._v_cache,
+    }
+        for name, buf in buffers.items():
+            ptr = buf.data_ptr()
+            if ptr % 16 != 0:
+                print(f"MISALIGNED SCRATCH: {name} ptr={ptr:#x} rem={ptr%16}")
 
+        # result_tensor = _decode(...)
+        # ptr = self._layer_weights_packed.data_ptr()
+        # assert ptr % 16 == 0, f"Misaligned! ptr={ptr:#x}, remainder={ptr % 16}"
+
+        result_tensor = _decode(
+            input_token_id,
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._act,
+            self._res,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_inter,
+            self._norm_out,
+            self._fmax_vals,
+            self._fmax_idxs,
+            NUM_LAYERS,
+            self._position,
+            MAX_SEQ_LEN,
+            self._attn_scale,
+        )
+        torch.cuda.synchronize()
+        self._out_token.copy_(result_tensor)
         self._position += 1
         return int(result_tensor.item())
     def reset(self):

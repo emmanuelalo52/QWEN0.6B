@@ -330,6 +330,7 @@ __device__ void ldg_attention(
             half* kc_ptr = k_cache + h * max_seq_len * HEAD_DIM + position * HEAD_DIM;
             half* vc_ptr = v_cache + h * max_seq_len * HEAD_DIM + position * HEAD_DIM;
 
+            // RMS norm
             float ss = 0.0f;
             for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE){
                 float val = __half2float(k_ptr[i]);
@@ -339,19 +340,31 @@ __device__ void ldg_attention(
             float inv_rms = rsqrtf(ss / (float)HEAD_DIM + 1e-6f);
             inv_rms = __shfl_sync(0xffffffff, inv_rms, 0);
 
-            for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE){
-                float k_val = __half2float(k_ptr[i]) * inv_rms * __half2float(k_norm_weight[i]);
+            // Normalize and collect values: each thread handles 4 dims (stride 32)
+            // Thread lane_id processes: [lane_id, lane_id+32, lane_id+64, lane_id+96]
+            // RoPE pairs: (0,64), (1,65), ..., so thread's vals[0] pairs with vals[2]
+            float k_vals[4];
+            #pragma unroll
+            for(int iter = 0; iter < 4; iter++){
+                int i = lane_id + iter * WARP_SIZE;
+                k_vals[iter] = __half2float(k_ptr[i]) * inv_rms * __half2float(k_norm_weight[i]);
+            }
+
+            // Apply RoPE: rotate (vals[0], vals[2]) and (vals[1], vals[3])
+            #pragma unroll
+            for(int iter = 0; iter < 4; iter++){
+                int i = lane_id + iter * WARP_SIZE;
                 float c = __half2float(cos_pos[i]);
                 float s = __half2float(sin_pos[i]);
                 
-                // RoPE: [x, y] -> [x*c - y*s, x*s + y*c] using half-dim swap
-                int po = (i < HEAD_DIM / 2) ? (HEAD_DIM / 2) : -(HEAD_DIM / 2);
-                (void)po;
-                float k_neighbor = __shfl_xor_sync(0xffffffff, k_val, 16); // Works if HEAD_DIM iterations are managed
-                // For sm_75, we'll use a simpler paired register approach:
-                float k_rot = (i < HEAD_DIM / 2) ? (k_val * c - __shfl_sync(0xffffffff, k_val, lane_id + 16) * s) : (k_val * c + __shfl_sync(0xffffffff, k_val, lane_id - 16) * s);
-                
+                float x = (iter < 2) ? k_vals[iter]     : k_vals[iter - 2];
+                float y = (iter < 2) ? k_vals[iter + 2] : k_vals[iter];
+                float k_rot = (iter < 2) ? (x*c - y*s) : (x*s + y*c);
                 kc_ptr[i] = __float2half(k_rot);
+            }
+
+            // V cache (no rotation)
+            for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE){
                 vc_ptr[i] = v[h * HEAD_DIM + i];
             }
         }
@@ -365,6 +378,8 @@ __device__ void ldg_attention(
 
         for(int qh = q_start; qh < q_end; qh++){
             half* q_ptr = q + qh * HEAD_DIM;
+            
+            // RMS norm
             float ss = 0.0f;
             for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE) {
                 float v = __half2float(q_ptr[i]);
@@ -374,12 +389,24 @@ __device__ void ldg_attention(
             float inv_rms = rsqrtf(ss / (float)HEAD_DIM + 1e-6f);
             inv_rms = __shfl_sync(0xffffffff, inv_rms, 0);
 
-            for(int i = lane_id; i < HEAD_DIM; i += WARP_SIZE){
-                float q_val = __half2float(q_ptr[i]) * inv_rms * __half2float(q_norm_weight[i]);
+            // Normalize and collect
+            float q_vals[4];
+            #pragma unroll
+            for(int iter = 0; iter < 4; iter++){
+                int i = lane_id + iter * WARP_SIZE;
+                q_vals[iter] = __half2float(q_ptr[i]) * inv_rms * __half2float(q_norm_weight[i]);
+            }
+
+            // Apply RoPE
+            #pragma unroll
+            for(int iter = 0; iter < 4; iter++){
+                int i = lane_id + iter * WARP_SIZE;
                 float c = __half2float(cos_pos[i]);
                 float s = __half2float(sin_pos[i]);
-                // Simplified rotation for GTX 1650
-                float q_rot = (i < HEAD_DIM / 2) ? (q_val * c - __shfl_xor_sync(0xffffffff, q_val, 16) * s) : (q_val * c + __shfl_xor_sync(0xffffffff, q_val, 16) * s);
+                
+                float x = (iter < 2) ? q_vals[iter]     : q_vals[iter - 2];
+                float y = (iter < 2) ? q_vals[iter + 2] : q_vals[iter];
+                float q_rot = (iter < 2) ? (x*c - y*s) : (x*s + y*c);
                 q_ptr[i] = __float2half(q_rot);
             }
         }
@@ -405,9 +432,9 @@ __device__ void ldg_attention(
     grid.sync();
 
     // --- 3. Attention Computation ---
-    __shared__ float s_max_score[LDG_NUM_WARPS];
-    __shared__ float s_sum_exp[LDG_NUM_WARPS];
-    __shared__ float s_out_acc[LDG_NUM_WARPS][HEAD_DIM];
+    __shared__ __align__(16) float s_max_score[LDG_NUM_WARPS];
+    __shared__ __align__(16) float s_sum_exp[LDG_NUM_WARPS];
+    __shared__ __align__(16) float s_out_acc[LDG_NUM_WARPS][HEAD_DIM];
 
     if(block_id < LDG_ATTN_BLOCKS){
         int heads_per_block = (NUM_Q_HEADS + LDG_ATTN_BLOCKS - 1) / LDG_ATTN_BLOCKS;
@@ -708,7 +735,7 @@ __device__ void ldg_decode_body(
     grid.sync();
 
     // Shared memory for the normalized activation (reused every layer).
-    __shared__ half s_norm[HIDDEN_SIZE];
+    __shared__ __align__(16) half s_norm[HIDDEN_SIZE];
 
     // ── 2. Transformer layers ────────────────────────────────────────────────
     for (int layer = 0; layer < num_layers; layer++) {
@@ -721,7 +748,7 @@ __device__ void ldg_decode_body(
             cg::thread_block blk = cg::this_thread_block();
             cg::thread_block_tile<32> warp = cg::tiled_partition<32>(blk);
             __shared__ float s_rms_inv;
-            __shared__ float s_reduce[LDG_BLOCK_SIZE / WARP_SIZE];
+            __shared__ __align__(16) float s_reduce[LDG_BLOCK_SIZE / WARP_SIZE];
 
             float ss = 0.0f;
             for (int i = tid; i < HIDDEN_SIZE / 4; i += LDG_BLOCK_SIZE) {

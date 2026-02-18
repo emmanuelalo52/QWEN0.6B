@@ -3,10 +3,12 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+struct LDGLayerWeight;
+
 // Forward declarations of C functions from megakernel.cu
 extern "C" void launch_ldg_decode_direct(
     int input_token_id, int *output_token_id, const void *embed_weight,
-    const void *layer_weights, const void *final_norm_weight,
+    const LDGLayerWeight *layer_weights, const void *final_norm_weight,
     const void *lm_head_weight, const void *cos_table, const void *sin_table,
     void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
@@ -16,7 +18,7 @@ extern "C" void launch_ldg_decode_direct(
 
 extern "C" void launch_ldg_generate_nosync(
     int first_token_id, int num_steps, const void *embed_weight,
-    const void *layer_weights, const void *final_norm_weight,
+    const LDGLayerWeight *layer_weights, const void *final_norm_weight,
     const void *lm_head_weight, const void *cos_table, const void *sin_table,
     void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
@@ -65,7 +67,7 @@ torch::Tensor decode(
         input_token_id,
         output_token_id.data_ptr<int>(),
         embed_weight.data_ptr(),
-        layer_weights_packed.data_ptr(),
+        reinterpret_cast<const LDGLayerWeight*>(layer_weights_packed.data_ptr()),
         final_norm_weight.data_ptr(),
         lm_head_weight.data_ptr(),
         cos_table.data_ptr(),
@@ -130,7 +132,7 @@ torch::Tensor generate_nosync(
         first_token_id,
         num_steps,
         embed_weight.data_ptr(),
-        layer_weights_packed.data_ptr(),
+        reinterpret_cast<const LDGLayerWeight*>(layer_weights_packed.data_ptr()),
         final_norm_weight.data_ptr(),
         lm_head_weight.data_ptr(),
         cos_table.data_ptr(),
