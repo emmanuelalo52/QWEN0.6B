@@ -368,6 +368,13 @@ __device__ void ldg_attention(
                 vc_ptr[i] = v[h * HEAD_DIM + i];
             }
         }
+        // if (threadIdx.x == 0) {
+        //     printf("Block 0: k_cache ptr = %llu, values: %f %f %f %f\n",
+        //         (unsigned long long)k_cache,
+        //         __half2float(k_cache[0]), __half2float(k_cache[1]),
+        //         __half2float(k_cache[2]), __half2float(k_cache[3]));
+        // }
+        __threadfence();
     }
 
     // Attention blocks: Handle Q norm + RoPE
@@ -435,7 +442,12 @@ __device__ void ldg_attention(
     __shared__ __align__(16) float s_max_score[LDG_NUM_WARPS];
     __shared__ __align__(16) float s_sum_exp[LDG_NUM_WARPS];
     __shared__ __align__(16) float s_out_acc[LDG_NUM_WARPS][HEAD_DIM];
-
+    s_max_score[warp_id] = -INFINITY;
+    s_sum_exp[warp_id] = 0.0f;
+    for (int i = lane_id; i < HEAD_DIM; i += WARP_SIZE) {
+        s_out_acc[warp_id][i] = 0.0f;
+    }
+    __syncthreads();
     if(block_id < LDG_ATTN_BLOCKS){
         int heads_per_block = (NUM_Q_HEADS + LDG_ATTN_BLOCKS - 1) / LDG_ATTN_BLOCKS;
         int q_start = block_id * heads_per_block;
@@ -475,21 +487,39 @@ __device__ void ldg_attention(
             __syncthreads();
 
             if (warp_id == 0) {
-                float global_max = s_max_score[0];
-                for (int w = 1; w < LDG_NUM_WARPS; w++) global_max = fmaxf(global_max, s_max_score[w]);
-                
-                float total_sum = 0.0f;
-                float final_acc[4] = {0.0f};
-                for (int w = 0; w < LDG_NUM_WARPS; w++) {
-                    float scale = expf(s_max_score[w] - global_max);
-                    total_sum += s_sum_exp[w] * scale;
+                // Find global max only among warps that actually processed tokens
+                float max_score = -INFINITY;
+                float sum_exp = 0.0f;
+                float acc[4] = {0.0f};
+                for (int t = 0; t < cache_len; t++) {
+                    half* kc = k_cache + kv_head * max_seq_len * HEAD_DIM + t * HEAD_DIM;  // active warp
+                    float score = 0.0f;
                     #pragma unroll
-                    for (int i = 0; i < 4; i++) final_acc[i] += s_out_acc[w][lane_id + i * 32] * scale;
+                    for (int i = lane_id; i < HEAD_DIM; i += 32) score += __half2float(q_head[i]) * __half2float(kc[i]);    
+                    score = ldg_warp_reduce_sum(score) * attn_scale;
+                    score = __shfl_sync(0xffffffff, score, 0);
+                    float old_max = max_score;
+                    max_score = fmaxf(max_score, score);
+                    float e = expf(score - max_score);                
+                    float e_old = expf(old_max - max_score);
+                    sum_exp = sum_exp * e_old + e;
+                    half* vc = v_cache + kv_head * max_seq_len * HEAD_DIM + t * HEAD_DIM;
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) acc[i] = acc[i] * e_old + e * __half2float(vc[lane_id + i * 32]);
                 }
-                
                 half* out_head = attn_out + qh * HEAD_DIM;
                 #pragma unroll
-                for (int i = 0; i < 4; i++) out_head[lane_id + i * 32] = __float2half(final_acc[i] / total_sum);
+                for (int i = 0; i < 4; i++) {
+                    out_head[lane_id + i * 32] = __float2half(acc[i] / sum_exp);
+                }
+
+                // Debug print (optional)
+                // if (block_id == 0 && qh == 0 && lane_id == 0) {
+                //     printf("Step %d: attention out[0..3] = %f %f %f %f\n",
+                //         position,
+                //         __half2float(out_head[0]), __half2float(out_head[1]),
+                //         __half2float(out_head[2]), __half2float(out_head[3]));
+                // }
             }
             __syncthreads();
         }
@@ -536,10 +566,9 @@ __device__ void ldg_o_proj_postnorm_mlp(
 
         #pragma unroll 4
         for (int k = lane_id; k < Q_SIZE / 8; k += WARP_SIZE) {
-            // 128-bit optimized load from megakernel.cu
             uint4 w_u4 = ldg_load_weights_u4(o_row_ptr + k);
             uint4 a_u4 = *reinterpret_cast<const uint4*>(s_attn + k * 8);
-            
+
             half2* wh = reinterpret_cast<half2*>(&w_u4);
             half2* ah = reinterpret_cast<half2*>(&a_u4);
             #pragma unroll
@@ -551,7 +580,10 @@ __device__ void ldg_o_proj_postnorm_mlp(
         }
         sum = ldg_warp_reduce_sum(sum);
         if (lane_id == 0) {
-            g_activations[m] = sum + g_residual[m];
+            // pre_norm = o_proj(attn) + original residual
+            float pre_norm = sum + g_residual[m];
+            g_activations[m] = pre_norm;   // store for later use
+            // (hidden_out will be overwritten by MLP output, so no write here)
         }
     }
 
@@ -863,6 +895,11 @@ __device__ void ldg_decode_body(
             g_normalized[i] = __half2float(hidden_buffer[i]) * inv_rms * w;
         }
     }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        printf("Step %d: g_normalized[0..3] = %f %f %f %f\n",
+            position,
+            g_normalized[0], g_normalized[1], g_normalized[2], g_normalized[3]);
+    }
     grid.sync();
 }
 
@@ -1104,6 +1141,7 @@ extern "C" void launch_ldg_decode_direct(
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
 
+  // Launch decode kernel
   ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
       (const half *)embed_weight, layer_weights,
       (const half *)final_norm_weight,
@@ -1115,6 +1153,10 @@ extern "C" void launch_ldg_decode_direct(
       d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
       position, input_token_id, max_seq_len, attn_scale);
 
+  // Wait for decode kernel to finish and make writes visible
+  cudaStreamSynchronize(stream);
+
+  // Now launch LM head kernels
   ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
       (const float *)g_normalized, 
       (const half *)lm_head_weight,
@@ -1212,6 +1254,9 @@ extern "C" void launch_ldg_generate_nosync(
         (half *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
         d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
         d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
+
+    // Wait for decode kernel to finish before LM head
+    cudaStreamSynchronize(stream);
 
     ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,

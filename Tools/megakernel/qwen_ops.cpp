@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cstdint>
-
+#include <c10/cuda/CUDAStream.h>
 struct LDGLayerWeight;
 
 // Forward declarations of C functions from megakernel.cu
@@ -58,6 +58,7 @@ torch::Tensor decode(
     float attn_scale
 ) {
     auto output_token_id = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     
     // GTX 1650 HARDWARE GUARD: Ensure the pointer table is 16-byte aligned
     uintptr_t ptr_val = reinterpret_cast<uintptr_t>(layer_weights_packed.data_ptr());
@@ -89,9 +90,9 @@ torch::Tensor decode(
         position,
         max_seq_len,
         attn_scale,
-        0 // default stream
+        stream // default stream
     );
-
+    
     return output_token_id;
 }
 
@@ -123,6 +124,8 @@ torch::Tensor generate_nosync(
     float attn_scale
 ) {
     auto output_log = torch::zeros({num_steps}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
     
     // GTX 1650 HARDWARE GUARD
     uintptr_t ptr_val = reinterpret_cast<uintptr_t>(layer_weights_packed.data_ptr());
@@ -155,7 +158,7 @@ torch::Tensor generate_nosync(
         start_position,
         max_seq_len,
         attn_scale,
-        0 // default stream
+        stream // default stream
     );
     
     return output_log;

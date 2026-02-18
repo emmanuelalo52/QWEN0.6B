@@ -94,6 +94,7 @@ def bench_megakernel():
 def correctness_check():
     import os
     import torch
+    import traceback
 
     # Disable HF Hub progress bars and warnings for a cleaner output
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -117,8 +118,14 @@ def correctness_check():
 
     from Qwen06B_architecture import Decoder
 
-    # Initialize your custom Megakernel decoder
-    dec = Decoder(weights=None, tokenizer=tokenizer, verbose=False)
+    # Initialize your custom Megakernel decoder with error catching
+    print("Initializing Megakernel decoder...")
+    try:
+        dec = Decoder(weights=None, tokenizer=tokenizer, verbose=False)
+    except Exception as e:
+        print(f"❌ Decoder initialization failed: {e}")
+        traceback.print_exc()
+        return
 
     # 1. Generate Baseline tokens with Hugging Face
     input_ids = tokenizer(PROMPT, return_tensors="pt").input_ids.cuda()
@@ -126,29 +133,71 @@ def correctness_check():
         output = model.generate(
             input_ids,
             max_new_tokens=CHECK_TOKENS,
-            do_sample=False,      # Greedy decoding for deterministic comparison
+            do_sample=False,
             use_cache=True,
             pad_token_id=tokenizer.pad_token_id,
         )
     # Extract only the newly generated tokens
     hf_ids = output[0, -CHECK_TOKENS:].tolist()
+    print(f"HF tokens: {hf_ids}")
 
-    # 2. Generate tokens with Megakernel (MK)
+    # 2. Extract HF's KV cache after processing the prompt (before generation)
+    with torch.no_grad():
+        # Run a single forward pass with the prompt to get past_key_values
+        outputs = model(input_ids, use_cache=True, past_key_values=None)
+        past_kv = outputs.past_key_values
+    # past_kv is a tuple of tuples: ( (k_layer0, v_layer0), (k_layer1, v_layer1), ... )
+    first_k_hf = past_kv[0][0][0, 0, 0, :4].cpu().float().tolist()   # layer 0, head 0, pos 0
+    first_v_hf = past_kv[0][1][0, 0, 0, :4].cpu().float().tolist()
+    print(f"HF first token K cache (first 4 dims): {first_k_hf}")
+    print(f"HF first token V cache (first 4 dims): {first_v_hf}")
+
+    # 3. Generate tokens with Megakernel using only step()
     dec.reset()
     prompt_ids = input_ids[0].tolist()
-    
+    print(f"Prompt IDs: {prompt_ids}")
+
     # Prefill the prompt (except the last token)
-    for tid in prompt_ids[:-1]:
-        dec.step(tid)
-    
+    for i, tid in enumerate(prompt_ids[:-1]):
+        print(f"Prefill step {i}: input {tid}")
+        try:
+            out = dec.step(tid)
+            print(f"  → output {out} (should be ignored)")
+        except Exception as e:
+            print(f"❌ Error during prefill step {i}: {e}")
+            traceback.print_exc()
+            return
+    print(f"K cache pointer (Python): {dec._k_cache.data_ptr()}")
+
     mk_ids = []
     tok = prompt_ids[-1]
-    # Generate tokens one by one
-    for _ in range(CHECK_TOKENS):
-        tok = dec.step(tok)
-        mk_ids.append(tok)
 
-    # 3. Compare Results
+    # Print Megakernel cache after prefilling (should correspond to HF's cache above)
+    first_k_cache_entry = dec._k_cache[0, 0, 0, :4].cpu().float().tolist()
+    first_v_cache_entry = dec._v_cache[0, 0, 0, :4].cpu().float().tolist()
+    print(f"Megakernel first token K cache (first 4 dims): {first_k_cache_entry}")
+    print(f"Megakernel first token V cache (first 4 dims): {first_v_cache_entry}")
+
+    # Print the pointer address of the K cache tensor
+    print(f"K cache pointer (Python): {dec._k_cache.data_ptr()}")
+
+    print(f"Starting generation from token {tok}")
+    for step_idx in range(CHECK_TOKENS):
+        print(f"Generation step {step_idx}: input {tok}")
+        try:
+            tok = dec.step(tok)
+            # After the first generation step, check the cache content
+            if step_idx == 0:
+                cache_after_first = dec._k_cache[0, 0, 0, :4].cpu().float().tolist()
+                print(f"After step 0, K cache (first 4): {cache_after_first}")
+            mk_ids.append(tok)
+            print(f"  → output {tok}")
+        except Exception as e:
+            print(f"❌ Error during generation step {step_idx}: {e}")
+            traceback.print_exc()
+            return
+
+    # 4. Compare Results
     matches = sum(1 for h, m in zip(hf_ids, mk_ids) if h == m)
     accuracy = (matches / CHECK_TOKENS) * 100
 
@@ -158,12 +207,11 @@ def correctness_check():
     print(f"HF tokens: {hf_ids}")
     print(f"MK tokens: {mk_ids}")
     print(f"Accuracy:  {accuracy:.2f}% ({matches}/{CHECK_TOKENS} tokens matched)")
-    
+
     if accuracy == 100:
         print("\n✅ SUCCESS: Megakernel output matches Hugging Face exactly.")
     else:
         print("\n❌ FAILURE: Mismatch detected. Check weight loading or kernel logic.")
-        # Debugging: Show decoded text to see how far they diverged
         print(f"HF text: '{tokenizer.decode(hf_ids)}'")
         print(f"MK text: '{tokenizer.decode(mk_ids)}'")
 

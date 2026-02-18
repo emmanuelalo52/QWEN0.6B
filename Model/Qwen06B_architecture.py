@@ -113,7 +113,7 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
         print(f"Loading {model_name}...")
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.float16, device_map="cuda"
+        model_name, torch_dtype=torch.float16, device_map="cuda"
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     state = model.state_dict()
@@ -169,15 +169,12 @@ def _pack_layer_weights(layer_weights: list) -> torch.Tensor:
         base = li * N
         for j in range(N):
             all_ptrs.append(layer_weights[base + j].data_ptr())
-        all_ptrs.append(0)  # padding slot
+        all_ptrs.append(0)  # padding: struct is 12 pointers (96 bytes) on C++ side
 
-    # Allocate with explicit 16-byte alignment guarantee
-    # Allocate extra 1 element, then slice to align base to 16 bytes
-    t = torch.zeros(len(all_ptrs) + 1, dtype=torch.int64, device="cuda")
-    # Find the first index where data_ptr is 16-byte aligned
+    t = torch.zeros(len(all_ptrs) + 2, dtype=torch.int64, device="cuda")
     base_ptr = t.data_ptr()
-    offset = (16 - (base_ptr % 16)) % 16  # bytes to skip
-    offset_elems = offset // 8  # int64 elements to skip
+    offset = (16 - (base_ptr % 16)) % 16
+    offset_elems = offset // 8
     t_aligned = t[offset_elems : offset_elems + len(all_ptrs)]
     t_aligned.copy_(torch.tensor(all_ptrs, dtype=torch.int64))
     assert t_aligned.data_ptr() % 16 == 0, "Alignment failed!"
