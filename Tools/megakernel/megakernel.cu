@@ -9,9 +9,9 @@
 #include "swiglu.cu"
 namespace cg = cooperative_groups;
 
-// ---------------------------------------------------------------------------
+
 // Model constants
-// ---------------------------------------------------------------------------
+
 constexpr int WARP_SIZE       = 32;
 constexpr int HIDDEN_SIZE     = 1024;
 constexpr int INTERMEDIATE_SIZE = 3072;
@@ -21,9 +21,9 @@ constexpr int HEAD_DIM        = 128;
 constexpr int Q_SIZE          = NUM_Q_HEADS  * HEAD_DIM;  // 2048
 constexpr int KV_SIZE         = NUM_KV_HEADS * HEAD_DIM;  // 1024
 
-// ---------------------------------------------------------------------------
+
 // Tunable launch-config macros (can be overridden at compile time)
-// ---------------------------------------------------------------------------
+
 #ifndef LDG_NUM_BLOCKS
 #define LDG_NUM_BLOCKS 28
 #endif
@@ -80,12 +80,10 @@ constexpr int   LDG_NUM_WARPS = LDG_LM_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS   = 1e-6f;
 constexpr int   LDG_VOCAB_SIZE = 151936;
 
-// ---------------------------------------------------------------------------
+
 // Per-layer weight pointers
 // Field order here is the ground truth; Python _pack_layer_weights must match.
-// [FIX-6] Document the authoritative order so Python-side mismatches are
-//         caught early with the assert added in Qwen06B_architecture.py.
-// ---------------------------------------------------------------------------
+
 struct __align__(16) LDGLayerWeight {
     const half* input_layernorm_weight;      // [HIDDEN_SIZE]
     const half* q_proj_weight;               // [Q_SIZE,          HIDDEN_SIZE]
@@ -101,9 +99,9 @@ struct __align__(16) LDGLayerWeight {
     const void* padding;                     // struct = 12 × 8 = 96 bytes, 16-byte aligned
 };
 
-// ---------------------------------------------------------------------------
+
 // Grid-wide barrier (software, works with any occupancy)
-// ---------------------------------------------------------------------------
+
 struct AtomicGridSync {
     unsigned int *counter;
     unsigned int *generation;
@@ -130,9 +128,9 @@ struct AtomicGridSync {
     }
 };
 
-// ---------------------------------------------------------------------------
+
 // Small helpers
-// ---------------------------------------------------------------------------
+
 __device__ __forceinline__ float ldg_warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
@@ -168,11 +166,8 @@ __device__ __forceinline__ uint4 ldg_load_weights_u4(const uint4 *ptr) {
     return res;
 }
 
-// ---------------------------------------------------------------------------
+
 // device_rmsnorm_step  (utility, used when the fused path is needed)
-// [FIX-5] Removed the block_id==0 guard on residual writeback so every block
-//         correctly persists the fused residual when this function is called.
-// ---------------------------------------------------------------------------
 __device__ __forceinline__ void device_rmsnorm_step(
     half       *s_norm_out,
     const half *input,
@@ -201,7 +196,6 @@ __device__ __forceinline__ void device_rmsnorm_step(
         h2_res[0] = __hadd2(h2_in[0], h2_res[0]);
         h2_res[1] = __hadd2(h2_in[1], h2_res[1]);
 
-        // [FIX-5] All blocks write the updated residual (not just block 0).
         reinterpret_cast<uint2*>(residual)[i] = v_res;
         reinterpret_cast<uint2*>(s_norm_out)[i] = v_res;
 
@@ -242,9 +236,9 @@ __device__ __forceinline__ void device_rmsnorm_step(
     block.sync();
 }
 
-// ---------------------------------------------------------------------------
+
 // QKV fused matrix-vector product
-// ---------------------------------------------------------------------------
+
 __device__ void ldg_matvec_qkv_fp16(
     AtomicGridSync &grid,
     half       *s_norm,
@@ -296,9 +290,9 @@ __device__ void ldg_matvec_qkv_fp16(
     }
 }
 
-// ---------------------------------------------------------------------------
+
 // L2 prefetch helper
-// ---------------------------------------------------------------------------
+
 __device__ void ldg_prefetch_weights_l2(const half *weights, int num_elements) {
     int num_vec = num_elements / 8;
     for (int i = threadIdx.x; i < num_vec; i += LDG_BLOCK_SIZE) {
@@ -307,22 +301,10 @@ __device__ void ldg_prefetch_weights_l2(const half *weights, int num_elements) {
     }
 }
 
-// ---------------------------------------------------------------------------
+
 // Attention: QK-norm, RoPE, KV-cache write, online-softmax attention
-//
-// [FIX-2] Added bounds-check: if position >= max_seq_len, return early to
-//         avoid indexing past the end of the KV cache allocation.
-//
-// [FIX-3] Removed redundant warp-0 serial recompute.  After distributing
-//         attention across warps, warp 0 now performs a correct multi-warp
-//         online-softmax reduction over the partial results stored in shared
-//         memory (s_max_score / s_sum_exp / s_out_acc).
-//
-// [FIX-4] RoPE cos/sin index fixed for the split-half rotation scheme.
-//         Elements in [HEAD_DIM/2 .. HEAD_DIM-1] (iter >= 2) must look up
-//         cos/sin at rope_idx = i - HEAD_DIM/2, not at i, so that both
-//         members of each rotation pair use the same frequency.
-// ---------------------------------------------------------------------------
+
+
 __device__ void ldg_attention(
     AtomicGridSync &grid,
     half       *q,
@@ -345,7 +327,6 @@ __device__ void ldg_attention(
     const half *u_w,
     const half *d_w)
 {
-    // [FIX-2] Bounds guard — never write past the allocated KV cache.
     if (position >= max_seq_len) {
         grid.sync();
         return;
@@ -386,8 +367,7 @@ __device__ void ldg_attention(
                              * __half2float(k_norm_weight[i]);
             }
 
-            // [FIX-4] Split-half RoPE: element i pairs with element i+HEAD_DIM/2.
-            //         Both must use the same cos/sin frequency, i.e. rope_idx = i % (HEAD_DIM/2).
+            // Both must use the same cos/sin frequency, i.e. rope_idx = i % (HEAD_DIM/2).
             #pragma unroll
             for (int iter = 0; iter < 4; iter++) {
                 int i        = lane_id + iter * WARP_SIZE;
@@ -438,7 +418,6 @@ __device__ void ldg_attention(
                              * __half2float(q_norm_weight[i]);
             }
 
-            // [FIX-4] Same cos/sin index fix for Q
             #pragma unroll
             for (int iter = 0; iter < 4; iter++) {
                 int i        = lane_id + iter * WARP_SIZE;
@@ -475,15 +454,7 @@ __device__ void ldg_attention(
 
     grid.sync();
 
-    // -----------------------------------------------------------------------
     // 4. Online-softmax attention  (one block per Q head)
-    //
-    // [FIX-3] Each warp computes its own partial online-softmax over the
-    //         tokens it owns (stride LDG_NUM_WARPS).  Partial results are
-    //         stored in shared memory.  Warp 0 then reduces those partials
-    //         with a correct rescaled merge and writes the output.
-    //         The old "warp 0 serial recompute" loop is removed entirely.
-    // -----------------------------------------------------------------------
 
     // Shared memory layout for the warp-level partial results.
     // HEAD_DIM entries per warp for the value accumulator.
@@ -544,7 +515,6 @@ __device__ void ldg_attention(
                 s_out_acc[warp_id][lane_id + i * 32] = acc[i];
             __syncthreads();
 
-            // ---- [FIX-3] Warp-0 reduces all partial results correctly ----
             if (warp_id == 0) {
                 // How many warps actually processed at least one token?
                 int nw = min(LDG_NUM_WARPS, (cache_len + LDG_NUM_WARPS - 1));
@@ -582,14 +552,9 @@ __device__ void ldg_attention(
     grid.sync();
 }
 
-// ---------------------------------------------------------------------------
+
 // O-projection + Post-attention RMSNorm + SwiGLU MLP
-//
-// [FIX-1] Signature changed: attn_out is now `const half*` (direct reference
-//         to g_attn_out), not a float alias of g_activations.  This eliminates
-//         the aliasing between the read buffer and the write buffer that was
-//         corrupting the residual stream every layer and causing NaN at layer 26.
-// ---------------------------------------------------------------------------
+
 __device__ void ldg_o_proj_postnorm_mlp(
     AtomicGridSync       &grid,
     const half *__restrict__ o_weight,
@@ -597,7 +562,7 @@ __device__ void ldg_o_proj_postnorm_mlp(
     const half *__restrict__ gate_weight,
     const half *__restrict__ up_weight,
     const half *__restrict__ down_weight,
-    const half *__restrict__ attn_out,        // [FIX-1] half*, not float* alias
+    const half *__restrict__ attn_out,
     float      *__restrict__ g_residual,      // pre-attn residual (float)
     float      *__restrict__ g_activations,   // scratch: post-o-proj hidden (float)
     float      *__restrict__ g_mlp_intermediate,
@@ -613,15 +578,11 @@ __device__ void ldg_o_proj_postnorm_mlp(
     __shared__ __align__(16) half s_act[HIDDEN_SIZE];
     __shared__ __align__(16) half s_mlp[INTERMEDIATE_SIZE];
 
-    // [FIX-1] Load attn_out (half) directly — no float conversion needed,
-    //         and no conflict with g_activations since these are different types.
     for (int i = threadIdx.x; i < Q_SIZE; i += LDG_BLOCK_SIZE)
         s_attn[i] = attn_out[i];
     __syncthreads();
 
-    // ------------------------------------------------------------------
     // O-projection: hidden[m] = (o_weight[m,:] · attn_out) + residual[m]
-    // ------------------------------------------------------------------
     int hid_per_block = (HIDDEN_SIZE + num_blocks - 1) / num_blocks;
     int hid_start     = block_id * hid_per_block;
     int hid_end       = min(hid_start + hid_per_block, HIDDEN_SIZE);
@@ -747,9 +708,9 @@ __device__ void ldg_o_proj_postnorm_mlp(
     grid.sync();
 }
 
-// ---------------------------------------------------------------------------
+
 // Global barrier / persistent-kernel state
-// ---------------------------------------------------------------------------
+
 static unsigned int *d_barrier_counter = nullptr;
 static unsigned int *d_barrier_sense   = nullptr;
 static unsigned int *d_kv_flag         = nullptr;
@@ -775,9 +736,9 @@ static void ensure_barrier_alloc() {
     cudaMemset(d_attn_flag,       0, sizeof(unsigned int));
 }
 
-// ---------------------------------------------------------------------------
+
 // Device step-update kernel (used by generate_nosync)
-// ---------------------------------------------------------------------------
+
 __global__ void ldg_update_step(
     const int *__restrict__ lm_output,
     int       *__restrict__ d_token_id,
@@ -796,9 +757,9 @@ __global__ void ldg_update_step(
 // Forward declaration (kernel attributes helper defined after all kernels)
 static inline void ldg_configure_kernel_attributes();
 
-// ---------------------------------------------------------------------------
+
 // Shared decode body — called by both the direct and persistent wrappers
-// ---------------------------------------------------------------------------
+
 __device__ void ldg_decode_body(
     const half *embed_weight,
     const LDGLayerWeight *layer_weights,
@@ -905,15 +866,12 @@ __device__ void ldg_decode_body(
         // grid.sync() is called at the end of ldg_attention
 
         // ---- 2d. Prepare residual for o-proj ----
-        // [FIX-1] We no longer copy g_attn_out into g_activations here.
-        //         Only the pre-attn residual needs to be captured in float.
-        //         g_attn_out (half) is passed directly to ldg_o_proj_postnorm_mlp.
+        
         for (int i = tid; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
             g_residual[i] = __half2float(hidden_buffer[i]);
         grid.sync();
 
         // ---- 2e. O-proj + Post-norm + MLP ----
-        // [FIX-1] Pass g_attn_out (const half*) as the attn input, not g_activations.
         ldg_o_proj_postnorm_mlp(
             grid,
             lw.o_proj_weight,
@@ -921,7 +879,7 @@ __device__ void ldg_decode_body(
             lw.gate_proj_weight,
             lw.up_proj_weight,
             lw.down_proj_weight,
-            g_attn_out,       // [FIX-1] half* — no alias with g_activations
+            g_attn_out,
             g_residual,
             g_activations,    // used only for post-o-proj hidden (no overlap)
             g_mlp_intermediate,
@@ -961,9 +919,9 @@ __device__ void ldg_decode_body(
     grid.sync();
 }
 
-// ---------------------------------------------------------------------------
+
 // Kernel wrappers
-// ---------------------------------------------------------------------------
+
 __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_direct(
     const half           *embed_weight,
     const LDGLayerWeight *layer_weights,
@@ -984,7 +942,7 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_direct(
     grid.counter    = barrier_counter;
     grid.generation = barrier_sense;
     grid.nblocks    = gridDim.x;
-    // BUG FIX: grid.sync() works by spinning until *generation > my_gen.
+    
     // local_gen tracks the "current generation" each block expects next.
     // Across kernel invocations, d_barrier_sense accumulates (it is never reset
     // between calls — resetting it would break in-flight kernels).
@@ -993,8 +951,6 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_direct(
     // very start, so every single grid.sync() returns immediately without any
     // actual synchronization. This causes full data-race corruption from token 2
     // onward (token 1 was fine only because d_barrier_sense was 0 at that point).
-    // Fix: read the current d_barrier_sense value so local_gen starts at the
-    // correct baseline, making each sync() wait for exactly one new increment.
     grid.local_gen  = *barrier_sense;
 
     ldg_decode_body(
@@ -1039,9 +995,9 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE) ldg_decode_kernel_persistent(
         grid);
 }
 
-// ---------------------------------------------------------------------------
+
 // LM head — Phase 1: distributed vocab projection + per-block argmax
-// ---------------------------------------------------------------------------
+
 __global__ void __launch_bounds__(LDG_LM_BLOCK_SIZE, 1) ldg_lm_head_phase1(
     const float *__restrict__ normalized,
     const half  *__restrict__ weight,
@@ -1152,9 +1108,9 @@ __global__ void __launch_bounds__(LDG_LM_BLOCK_SIZE, 1) ldg_lm_head_phase1(
     }
 }
 
-// ---------------------------------------------------------------------------
+
 // LM head — Phase 2: global argmax reduction
-// ---------------------------------------------------------------------------
+
 __global__ void __launch_bounds__(LDG_LM_BLOCK_SIZE, 1) ldg_lm_head_phase2(
     const float *__restrict__ block_max_vals,
     const int   *__restrict__ block_max_idxs,
@@ -1187,9 +1143,9 @@ __global__ void __launch_bounds__(LDG_LM_BLOCK_SIZE, 1) ldg_lm_head_phase2(
         *output_token = s_data[0].idx;
 }
 
-// ---------------------------------------------------------------------------
+
 // Launch functions (C linkage for Python extension)
-// ---------------------------------------------------------------------------
+
 
 extern "C" void launch_ldg_decode_direct(
     int input_token_id, int *output_token_id,
@@ -1255,7 +1211,7 @@ extern "C" void launch_ldg_decode_persistent(
     ldg_configure_kernel_attributes();
     ensure_barrier_alloc();
 
-    // Same barrier_counter reset as launch_ldg_decode_direct — see comment there.
+    // Same barrier_counter reset as launch_ldg_decode_direct
     cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
 
     *h_pinned_position = position;
@@ -1287,13 +1243,7 @@ extern "C" void launch_ldg_decode_persistent(
         output_token_id, LDG_LM_NUM_BLOCKS);
 }
 
-// ---------------------------------------------------------------------------
 // generate_nosync: run N decode steps entirely on-device, no CPU round-trips
-//
-// [FIX-2] d_output_token is now zero-initialised at the start of every call
-//         so stale GPU state from a prior crashed run cannot carry over and
-//         produce a spurious first token or corrupt the output log.
-// ---------------------------------------------------------------------------
 extern "C" void launch_ldg_generate_nosync(
     int first_token_id, int num_steps,
     const void *embed_weight, const LDGLayerWeight *layer_weights,
@@ -1317,7 +1267,6 @@ extern "C" void launch_ldg_generate_nosync(
         cudaMalloc(&d_step_counter, sizeof(int));
         cudaMalloc(&d_output_token, sizeof(int));
     }
-    // [FIX-2] Reset both counters every call to avoid stale state.
     cudaMemsetAsync(d_step_counter, 0, sizeof(int), stream);
     cudaMemsetAsync(d_output_token, 0, sizeof(int), stream);
 
@@ -1364,9 +1313,7 @@ extern "C" void launch_ldg_generate_nosync(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Kernel attribute tuning (called once, lazily)
-// ---------------------------------------------------------------------------
 static inline void ldg_configure_kernel_attributes() {
     static bool configured = false;
     if (configured) return;
