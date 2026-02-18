@@ -21,6 +21,13 @@ KV_SIZE = 8 * HEAD_DIM   # 1024
 MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
+# Qwen3-0.6B config.json: "rope_theta": 1000000
+# Using 10000.0 (the LLaMA default) causes RoPE frequencies to be ~100x too high,
+# making every position > 0 produce completely wrong rotations.
+# Position 0 is always identity (cos(0)=1, sin(0)=0) so the first token is
+# unaffected — this is why token 1 matched HF but all subsequent tokens diverged.
+ROPE_THETA = 1_000_000.0
+
 
 def _require_megakernel_op(op_name: str):
     """Return an op from the extension module or torch.ops namespace."""
@@ -119,11 +126,18 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
     state = model.state_dict()
 
     # RoPE tables
+    # Compute inv_freq in float32 for numerical accuracy, then build the
+    # cos/sin table in float32 before casting to float16.
+    # Using float16 throughout causes large errors for theta=1e6 because very
+    # small inv_freq values (~ 1e-6) underflow to zero in fp16, making all
+    # high-frequency dimensions identical and destroying positional information.
     inv_freq = 1.0 / (
-        10000.0 ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float16) / HEAD_DIM)
+        ROPE_THETA ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
     )
-    positions = torch.arange(MAX_SEQ_LEN, dtype=torch.float16)
-    freqs = torch.outer(positions, inv_freq)
+    positions = torch.arange(MAX_SEQ_LEN, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)          # [MAX_SEQ_LEN, HEAD_DIM//2]
+    # repeat(1, 2) → [MAX_SEQ_LEN, HEAD_DIM]: dims i and i+HEAD_DIM//2 share the
+    # same frequency, matching HuggingFace's rotate_half convention.
     cos_table = torch.cos(freqs).repeat(1, 2).to(torch.float16).cuda().contiguous()
     sin_table = torch.sin(freqs).repeat(1, 2).to(torch.float16).cuda().contiguous()
 
@@ -161,9 +175,16 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
 
 
 def _pack_layer_weights(layer_weights: list) -> torch.Tensor:
-    N = 11
+    N = 11  # weights per layer — must match LDGLayerWeight field order in megakernel.cu:
+            # [0] input_layernorm, [1] q_proj, [2] k_proj, [3] v_proj,
+            # [4] q_norm,          [5] k_norm, [6] o_proj, [7] post_attn_norm,
+            # [8] gate_proj,       [9] up_proj,[10] down_proj
     n_layers = len(layer_weights) // N
-    assert len(layer_weights) == n_layers * N
+    assert len(layer_weights) == n_layers * N, (
+        f"Expected {n_layers * N} weight tensors ({N} per layer × {n_layers} layers), "
+        f"got {len(layer_weights)}. Check that load_weights() appends exactly {N} "
+        "tensors per layer in the same order as the LDGLayerWeight struct in megakernel.cu."
+    )
     all_ptrs = []
     for li in range(n_layers):
         base = li * N

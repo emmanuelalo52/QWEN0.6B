@@ -8,10 +8,28 @@ import torch
 
 warnings.filterwarnings("ignore")
 
-TOKENS = 100
+# Long prompt generation (≈1000 tokens)
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+sentence = "The quick brown fox jumps over the lazy dog. "
+target_tokens = 1000
+
+prompt_long = ""
+tokens = []
+while len(tokens) < target_tokens:
+    prompt_long += sentence
+    tokens = tokenizer.encode(prompt_long)
+# Trim to exactly target_tokens
+prompt_long = tokenizer.decode(tokens[:target_tokens], skip_special_tokens=True)
+print(f"Long prompt generated with {len(tokenizer.encode(prompt_long))} tokens.")
+
+
+TOKENS = 1000
 WARMUP = 3
 RUNS = 5
-PROMPT = "Hello"
+PROMPT = "Hello"                # short prompt for correctness check
+LONG_PROMPT = prompt_long       # long prompt for performance benchmarks
 CHECK_TOKENS = 8
 RUN_CORRECTNESS = True
 
@@ -35,7 +53,7 @@ def bench_pytorch_hf():
         "Qwen/Qwen3-0.6B", torch_dtype=torch.float16, device_map="cuda"
     )
     model.eval()
-    input_ids = tokenizer(PROMPT, return_tensors="pt").input_ids.cuda()
+    input_ids = tokenizer(LONG_PROMPT, return_tensors="pt").input_ids.cuda()
 
     def run():
         with torch.no_grad():
@@ -73,7 +91,7 @@ def bench_megakernel():
 
     def run():
         dec.reset()
-        dec.generate(PROMPT, max_tokens=TOKENS)
+        dec.generate(LONG_PROMPT, max_tokens=TOKENS)
 
     for _ in range(WARMUP):
         run()
@@ -89,6 +107,22 @@ def bench_megakernel():
 
     avg = sum(times) / len(times)
     return TOKENS / avg, avg * 1000 / TOKENS
+
+
+def bench_megakernel_prefill():
+    """Measure prefill latency for the long prompt (no generation)."""
+    from Qwen06B_architecture import Decoder
+
+    dec = Decoder(verbose=False)
+    ids = dec.tokenizer.encode(LONG_PROMPT)
+    dec.reset()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for tid in ids:
+        dec.step(tid)   # includes the first generated token after last prompt token
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    return t1 - t0, len(ids)
 
 
 def correctness_check():
@@ -127,7 +161,6 @@ def correctness_check():
         traceback.print_exc()
         return
 
-    # 1. Generate Baseline tokens with Hugging Face
     input_ids = tokenizer(PROMPT, return_tensors="pt").input_ids.cuda()
     with torch.no_grad():
         output = model.generate(
@@ -137,11 +170,9 @@ def correctness_check():
             use_cache=True,
             pad_token_id=tokenizer.pad_token_id,
         )
-    # Extract only the newly generated tokens
     hf_ids = output[0, -CHECK_TOKENS:].tolist()
     print(f"HF tokens: {hf_ids}")
 
-    # 2. Extract HF's KV cache after processing the prompt (before generation)
     with torch.no_grad():
         # Run a single forward pass with the prompt to get past_key_values
         outputs = model(input_ids, use_cache=True, past_key_values=None)
@@ -152,7 +183,6 @@ def correctness_check():
     print(f"HF first token K cache (first 4 dims): {first_k_hf}")
     print(f"HF first token V cache (first 4 dims): {first_v_hf}")
 
-    # 3. Generate tokens with Megakernel using only step()
     dec.reset()
     prompt_ids = input_ids[0].tolist()
     print(f"Prompt IDs: {prompt_ids}")
@@ -231,10 +261,20 @@ if __name__ == "__main__":
         if RUN_CORRECTNESS:
             correctness_check()
             print()
-        mk_tok, mk_ms = bench_megakernel()
 
+        # Generation benchmark (long prompt + 1000 new tokens)
+        mk_tok, mk_ms = bench_megakernel()
         print()
         print("=" * 55)
-        print(f"{'Backend':<25} {'tok/s':>8} {'ms/tok':>8}")
+        print("Generation performance (prefill + 1000 generated tokens)")
         print("-" * 55)
-        print(f"{'Megakernel':<25} {mk_tok:>8.1f} {mk_ms:>8.2f}")
+        print(f"{'Megakernel':<25} {mk_tok:>8.1f} tok/s  {mk_ms:>8.2f} ms/tok")
+
+        # Prefill latency measurement (long prompt only)
+        prefill_time, num_tokens = bench_megakernel_prefill()
+        print()
+        print("=" * 55)
+        print(f"Prefill latency for {num_tokens} tokens")
+        print("-" * 55)
+        print(f"Total time: {prefill_time:.3f} s")
+        print(f"Per token:  {prefill_time*1000/num_tokens:.2f} ms/tok")
