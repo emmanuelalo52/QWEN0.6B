@@ -11,3 +11,7 @@ Inference/__pycache__/__init__.cpython-310.pyc
 Model/__pycache__/Qwen06B_architecture.cpython-310.pyc
 Model/diagnose.py
 .user
+qwen_megakernel.nsys-rep
+.gitignore
+qwen_profile.nsys-rep
+
