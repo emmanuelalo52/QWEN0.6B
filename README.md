@@ -13,12 +13,20 @@ A hand-written CUDA megakernel for running **Qwen3-0.6B** inference end-to-end o
 - [Installation](#installation)
 - [Usage](#usage)
   - [Python API](#python-api)
+  - [Interactive Chat](#interactive-chat)
   - [Benchmarking](#benchmarking)
+- [Profiling with Nsight](#profiling-with-nsight)
+  - [Environment Setup (WSL)](#environment-setup-wsl)
+  - [Nsight Systems — Timeline](#nsight-systems--timeline)
+  - [Nsight Compute — Kernel Deep Dive](#nsight-compute--kernel-deep-dive)
+  - [Reading the Results](#reading-the-results)
 - [Internals](#internals)
   - [megakernel.cu](#megakernelcu)
   - [qwen_ops.cpp](#qwen_opscpp)
   - [Qwen06B_architecture.py](#qwen06b_architecturepy)
   - [benchmark.py](#benchmarkpy)
+  - [chat.py](#chatpy)
+  - [profile_megakernel.py](#profile_megakernelpy)
 - [Weight Layout](#weight-layout)
 - [KV Cache](#kv-cache)
 - [RoPE Implementation Notes](#rope-implementation-notes)
@@ -67,7 +75,9 @@ Qwen0.6B/
 ├── megakernel.cu            # Core CUDA implementation (all transformer ops)
 ├── qwen_ops.cpp             # PyTorch C++ / pybind11 extension
 ├── Qwen06B_architecture.py  # Weight loading, packing, Python Decoder class
-└── benchmark.py             # Correctness check + speed comparison vs HF
+├── benchmark.py             # Correctness check + speed comparison vs HF
+├── chat.py                  # Interactive terminal Q&A using the megakernel decoder
+└── profile_megakernel.py    # NVTX-annotated profiling script for Nsight Systems/Compute
 ```
 
 ---
@@ -329,6 +339,44 @@ High-level Python layer. Key responsibilities:
 
 ---
 
+---
+
+## Interactive Chat
+
+`chat.py` provides a terminal REPL for conversational Q&A using the megakernel decoder directly. It uses Qwen3's native `<|im_start|>/<|im_end|>` chat template and maintains conversation history across turns.
+
+### Running
+
+```bash
+# Basic usage
+python chat.py
+
+# Custom max tokens per reply
+python chat.py --max_tokens 200
+
+# Custom system prompt
+python chat.py --system "You are a concise CUDA programming assistant."
+
+# Different model path (e.g. local weights)
+python chat.py --model /path/to/local/Qwen3-0.6B
+```
+
+### In-chat Commands
+
+| Command  | Effect                                              |
+|----------|-----------------------------------------------------|
+| `/reset` | Wipes the KV cache and clears conversation history  |
+| `/tokens`| Prints the current token position counter           |
+| `/quit`  | Exits the chat                                      |
+
+### Notes
+
+- The KV cache is **shared across turns**. As the conversation grows, position advances and the cache fills. Use `/reset` before starting an unrelated conversation or when approaching 2048 tokens.
+- Each reply is bounded by `--max_tokens`. If the model hits the context limit mid-reply it will truncate — `/reset` and retry with a shorter history.
+- The `<|im_end|>` token is stripped from responses automatically so only the clean reply text is printed.
+
+---
+
 ### `benchmark.py`
 
 Standalone script. Does not import from `Qwen06B_architecture` at module scope (imports happen inside functions), so it can be run even if the extension is absent — it will print an informative error.
@@ -452,6 +500,186 @@ Prefill runs each token through all 28 layers with a growing attention window (p
 | Short prompt generation          | ~120   |  ~8.3  |
 | Long prompt generation (1k ctx)  | ~38    | ~26.3  |
 | Prefill (1k tokens, sequential)  | ~87    | ~11.5  |
+
+---
+
+## Profiling with Nsight
+
+### Environment Setup (WSL)
+
+Running CUDA profiling tools from WSL requires the Windows NVIDIA driver (not a Linux driver) to be new enough to support the CUDA toolkit version installed in WSL.
+
+**Minimum Windows driver version for CUDA 13:** `570+`  
+**Recommended:** Download the latest **Game Ready Driver** (not Studio) for your GPU from https://www.nvidia.com/Download/index.aspx — select your GPU, OS as **Windows 11 64-bit**, and Download Type as **Game Ready Driver**.
+
+After installing on Windows and rebooting, restart WSL:
+
+```powershell
+# In Windows PowerShell (any terminal — VS Code, Windows Terminal, etc.)
+wsl --shutdown
+```
+
+Then verify in WSL:
+
+```bash
+nvidia-smi
+# Should show Driver Version: 591.86 (or newer) and CUDA Version: 13.x
+```
+
+**Critical WSL `libcuda` fix:** WSL ships its own `libcuda.so` bridge at `/usr/lib/wsl/lib/` that talks to the Windows driver. If an older system `libcuda.so` exists at `/lib/x86_64-linux-gnu/`, PyTorch may load the wrong one. Fix permanently:
+
+```bash
+# Ensure WSL lib is found first
+echo 'export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+
+# Make it available system-wide (needed for sudo/ncu)
+sudo bash -c 'echo "/usr/lib/wsl/lib" > /etc/ld.so.conf.d/wsl-cuda.conf'
+sudo ldconfig
+
+# Optionally remove the stale system libcuda to prevent future conflicts
+sudo rm /lib/x86_64-linux-gnu/libcuda.so
+sudo rm /lib/x86_64-linux-gnu/libcuda.so.1
+sudo ldconfig
+```
+
+Verify PyTorch sees the GPU:
+
+```bash
+python3 -c "import torch; print(torch.cuda.is_available())"
+# True
+```
+
+---
+
+### Nsight Systems — Timeline
+
+`profile_megakernel.py` wraps every logical phase in NVTX ranges and uses `cuProfilerStart`/`cuProfilerStop` to bracket the decode-only capture window, keeping the report focused and free of model-loading overhead.
+
+**NVTX range hierarchy:**
+
+```
+[Warmup]           — outside capture range (discarded)
+[Profile]
+  [Prefill]
+    [Prefill token 0]
+    [Prefill token 1]
+    ...
+  [Generation]      ← cudaProfilerStart opens here
+    [Decode step 0]
+    [Decode step 1]
+    ...             ← cudaProfilerStop closes here
+```
+
+**Run:**
+
+```bash
+nsys profile \
+  --output=qwen_megakernel \
+  --trace=cuda,nvtx \
+  --capture-range=cudaProfilerApi \
+  python profile_megakernel.py
+```
+
+Options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--prompt` | `"What is a neural network?"` | Input prompt |
+| `--prefill` | `10` | Max prefill tokens |
+| `--steps` | `20` | Decode steps to capture |
+| `--warmup` | `5` | Steps outside capture range |
+| `--model` | `Qwen/Qwen3-0.6B` | HuggingFace model name/path |
+
+**Copy report to Windows and open in Nsight Systems GUI:**
+
+```bash
+cp qwen_megakernel.nsys-rep "/mnt/c/Users/<YourUsername>/Documents/qwen_megakernel.nsys-rep"
+```
+
+Open **NVIDIA Nsight Systems 2025.3.2 (Ubuntu)** from the Windows Start menu → **File → Open**.
+
+---
+
+### Nsight Compute — Kernel Deep Dive
+
+`ncu` profiles individual CUDA kernels with detailed hardware counter metrics. Because `ncu` under `sudo` loses the user environment, pass it explicitly:
+
+```bash
+sudo -E LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH \
+    ncu \
+    --section-folder /opt/nvidia/nsight-compute/2025.3.1/sections \
+    --kernel-name ldg_decode_kernel_persistent \
+    --launch-count 1 \
+    --set full \
+    --export qwen_ncu \
+    python3 profile_megakernel.py --steps 1
+```
+
+For a lighter run collecting only the most actionable sections:
+
+```bash
+sudo -E LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH \
+    ncu \
+    --section-folder /opt/nvidia/nsight-compute/2025.3.1/sections \
+    --kernel-name ldg_decode_kernel_persistent \
+    --launch-count 1 \
+    --section MemoryWorkloadAnalysis \
+    --section WarpStateStatistics \
+    --section ComputeWorkloadAnalysis \
+    --export qwen_ncu \
+    python3 profile_megakernel.py --steps 1
+```
+
+Copy and open in Nsight Compute GUI:
+
+```bash
+cp qwen_ncu.ncu-rep "/mnt/c/Users/<YourUsername>/Documents/qwen_ncu.ncu-rep"
+```
+
+Open **NVIDIA Nsight Compute 2025.3.1 (Ubuntu)** from the Windows Start menu.
+
+---
+
+### Reading the Results
+
+**In Nsight Systems timeline:**
+
+| Row | What to look for |
+|-----|-----------------|
+| NVTX | Orange `Decode step N` bands — each should be roughly equal width |
+| CUDA API | Green blocks — `ldg_decode_kernel_persistent`, `ldg_lm_head_phase1`, `ldg_lm_head_phase2` |
+| Gaps between green blocks | CPU overhead / Python round-trip time between steps |
+
+Click any green CUDA block to see its exact name and duration in the Events View panel at the bottom. Right-click a row → **Show in Events View** to list all kernels with timings in a table.
+
+**Key metrics in Nsight Compute:**
+
+| Metric | What it tells you |
+|--------|------------------|
+| Memory throughput (% of peak) | GTX 1650 is memory-bound at long context — expect high DRAM utilisation |
+| Warp occupancy | Whether block size 256 fully utilises the SMs |
+| `ldg_decode_kernel_persistent` duration | Per-token compute time excluding lm_head |
+| `ldg_lm_head_phase1` duration | Vocabulary projection cost — scales with `VOCAB_SIZE = 151936` |
+
+On GTX 1650 (`sm_75`, 4 GB GDDR5, 128 GB/s bandwidth), decode at short context is primarily compute-bound in the projection layers; at long context (1 000+ tokens) it becomes memory-bound in the attention step as the KV cache footprint grows.
+
+---
+
+### `chat.py`
+
+Interactive terminal REPL. Formats prompts using Qwen3's `<|im_start|>/<|im_end|>` chat template, maintains multi-turn history, and supports `/reset`, `/tokens`, `/quit` commands. Strips `<|im_end|>` from model output automatically. Uses `Decoder.generate()` internally, which calls `generate_nosync` for bulk token production.
+
+---
+
+### `profile_megakernel.py`
+
+NVTX-annotated profiling harness. Key design decisions:
+
+- **Warmup outside capture range** — the first few kernel launches have JIT/driver overhead that would skew timing. Warmup steps run before `cuProfilerStart()` so they are excluded from the Nsight report.
+- **`cuProfilerStart`/`cuProfilerStop`** — used with `--capture-range=cudaProfilerApi` to give nsys a precise, narrow capture window containing only the decode kernels, not model loading or prefill.
+- **NVTX ranges via `torch.cuda.nvtx`** — each decode step, prefill token, and phase is wrapped so the Nsight Systems timeline shows human-readable labels aligned with the CUDA kernel rows.
+- **`ctypes.CDLL("libcuda.so")`** — loaded at import time to call `cuProfilerStart`/`cuProfilerStop` directly without needing the full CUDA Python bindings.
 
 ---
 
